@@ -1,0 +1,56 @@
+# Python и тестовые инструменты
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# IDE и ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Сборка и упаковка
+/build/
+/dist/
+*.spec
+
+# Локальные настройки, журналы и БД
+/config.toml
+*.log
+*.db
+*.db-wal
+*.db-shm
+summary_prompt.txt
+transcribe_queue.json
+transcribe_queue.lock
+
+# Секреты и локальное окружение
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.toml
+
+# Записи созвонов и производные файлы
+/records/
+*.pcm
+*.wav
+*.ogg
+*.mkv
+*.mp4
+*.m4a
+segments.json
+meta.json
+transcript.txt
+summary.txt

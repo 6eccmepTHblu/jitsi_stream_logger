@@ -1,0 +1,18 @@
+[project]
+name = "jitsi-stream-logger"
+version = "0.1.0"
+description = "Трей-приложение Windows: журналирование и запись созвонов Jitsi Meet в Chrome"
+requires-python = ">=3.12"
+dependencies = [
+    "pystray>=0.19",
+    "Pillow>=10",
+    "websockets>=13",
+    "PyAudioWPatch>=0.2.12.5",
+    "windows-capture>=1.4.0",
+    "pywin32>=306",
+    "winotify>=1.1",
+    "psutil>=5.9",
+]
+
+[tool.setuptools]
+packages = ["app", "app.recorder"]

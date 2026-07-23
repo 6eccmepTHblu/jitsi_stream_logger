@@ -1,0 +1,562 @@
+"""Машина состояний созвона: снапшоты от расширения -> журнал + управление записью.
+
+Состояния активного созвона:
+  active     — пользователь в конференции, идёт запись (если auto_record);
+  grace      — пользователь вышел/вкладка закрылась; ждём grace_seconds на случай
+               перезагрузки страницы (F5), запись продолжается;
+  finalizing — остановка рекордеров и сборка итоговых файлов.
+
+Второй одновременный созвон не записывается — только журналируется (log_only).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+from app import summarize, transcribe
+from app.config import Config
+from app.recorder import mux
+from app.recorder.audio import AudioRecorder
+from app.recorder.segments import SegmentLog
+from app.recorder.video import VideoRecorder
+from app.storage import Storage
+
+log = logging.getLogger(__name__)
+
+CHROME_TITLE_SUFFIXES = (" - Google Chrome", " – Google Chrome")
+
+
+def strip_chrome_suffix(title: str) -> str:
+    for s in CHROME_TITLE_SUFFIXES:
+        if title.endswith(s):
+            return title[: -len(s)]
+    return title
+
+
+def safe_name(s: str, max_len: int = 50) -> str:
+    s = re.sub(r"[^\w\-. а-яА-ЯёЁ]", "_", s, flags=re.UNICODE).strip(" ._")
+    return s[:max_len] or "room"
+
+
+@dataclass
+class TabState:
+    snapshot: dict
+    last_seen: float  # time.monotonic()
+
+
+@dataclass
+class LogOnlyCall:
+    call_id: int
+    room: str
+    started_ts: float
+    participants: dict[str, dict] = field(default_factory=dict)
+
+
+@dataclass
+class ActiveCall:
+    call_id: int
+    tab_id: int
+    room: str
+    url: str
+    title: str
+    started_ts: float
+    call_dir: Path | None
+    recorded: bool
+    state: str = "active"  # active | grace | finalizing
+    left_ts: float | None = None
+    participants: dict[str, dict] = field(default_factory=dict)
+    audio_muted: bool | None = None
+    mute_open_ts: float | None = None
+    mute_intervals: list[tuple[float, float]] = field(default_factory=list)
+    seglog: SegmentLog | None = None
+    rec_mic: AudioRecorder | None = None
+    rec_spk: AudioRecorder | None = None
+    rec_video: VideoRecorder | None = None
+
+
+class SessionManager:
+    def __init__(self, cfg: Config, storage: Storage, *,
+                 notify=None, set_tray=None):
+        self.cfg = cfg
+        self.storage = storage
+        # notify(title, msg); set_tray(state, text), state:
+        # idle|paused|logging|recording|grace|finalizing|transcribing
+        self.notify = notify or (lambda title, msg: None)
+        self.set_tray = set_tray or (lambda state, text: None)
+        self.paused = False
+        self.tabs: dict[int, TabState] = {}
+        self.call: ActiveCall | None = None
+        self.log_only: dict[int, LogOnlyCall] = {}
+        self._grace_task: asyncio.Task | None = None
+        self._finalize_tasks: set[asyncio.Task] = set()
+        self._postprocess_tasks: set[asyncio.Task] = set()
+        self._ignored_hosts: set[str] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._shutting_down = False
+
+    # ------------------------------------------------------------- входящие
+
+    async def handle_message(self, msg: dict) -> None:
+        if self._shutting_down:
+            return
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+        mtype = msg.get("type")
+        now = time.time()
+        if mtype == "snapshot":
+            await self._on_snapshot(msg, now)
+        elif mtype == "tab_closed":
+            await self._on_tab_closed(int(msg.get("tab_id", -1)), now)
+
+    async def _on_snapshot(self, msg: dict, now: float) -> None:
+        try:
+            tab_id = int(msg.get("tab_id"))
+        except (TypeError, ValueError):
+            return
+        url = str(msg.get("url") or "")
+        host = (urlparse(url).hostname or "").lower()
+        if host not in self.cfg.allowed_domains:
+            if host and host not in self._ignored_hosts:
+                self._ignored_hosts.add(host)
+                log.info("Снапшоты с домена %s игнорируются (нет в allowed_domains)", host)
+            return
+
+        snap = {
+            "joined": bool(msg.get("joined")),
+            "room": str(msg.get("room") or ""),
+            "participants": msg.get("participants"),  # list | None
+            "audioMuted": msg.get("audioMuted"),      # bool | None
+            "title": str(msg.get("title") or ""),
+            "url": url,
+            "via": msg.get("via"),
+        }
+        prev = self.tabs.get(tab_id)
+        prev_joined = bool(prev.snapshot.get("joined")) if prev else False
+        self.tabs[tab_id] = TabState(snap, time.monotonic())
+
+        if snap["joined"] and not prev_joined:
+            await self._on_joined(tab_id, snap, now)
+        elif not snap["joined"] and prev_joined:
+            await self._on_unjoined(tab_id, now, reason="left")
+
+        # Обновление деталей по активному созвону / log-only
+        c = self.call
+        if c and c.tab_id == tab_id and c.state in ("active", "grace") and snap["joined"]:
+            self._update_call_details(c, snap, now)
+        lo = self.log_only.get(tab_id)
+        if lo and snap["joined"]:
+            self._update_log_only(lo, snap, now)
+
+    async def _on_tab_closed(self, tab_id: int, now: float) -> None:
+        self.tabs.pop(tab_id, None)
+        c = self.call
+        if c and c.tab_id == tab_id and c.state == "active":
+            await self._enter_grace(c, "tab_closed", now)
+        lo = self.log_only.pop(tab_id, None)
+        if lo:
+            self._close_log_only(lo, now, "tab_closed")
+
+    # ------------------------------------------------------------- переходы
+
+    async def _on_joined(self, tab_id: int, snap: dict, now: float) -> None:
+        room = snap["room"] or "room"
+        c = self.call
+        if c is not None:
+            if c.state == "grace" and c.room == room:
+                # Возврат после F5/переоткрытия — продолжаем ту же сессию.
+                if self._grace_task:
+                    self._grace_task.cancel()
+                    self._grace_task = None
+                c.tab_id = tab_id
+                c.state = "active"
+                c.left_ts = None
+                self.storage.add_event(c.call_id, now, "rejoined", {"tab_id": tab_id})
+                log.info("Возврат в созвон «%s» — сессия #%d продолжается", room, c.call_id)
+                self._refresh_tray()
+                return
+            if c.tab_id == tab_id and c.state == "active":
+                return  # дубль
+            # Параллельный второй созвон — только журнал.
+            if tab_id not in self.log_only:
+                call_id = self.storage.create_call(
+                    room=room, url=snap["url"], tab_id=tab_id, started_ts=now,
+                    recorded=False, call_dir=None)
+                self.log_only[tab_id] = LogOnlyCall(call_id, room, now)
+                self.storage.add_event(call_id, now, "concurrent_conference",
+                                       {"recording_call_id": c.call_id})
+                log.warning("Второй одновременный созвон «%s» — только журнал", room)
+                self.notify("Второй созвон не записывается",
+                            f"Идёт запись «{c.room}»; «{room}» попадёт только в журнал")
+            return
+
+        if self.paused:
+            log.info("Обнаружение на паузе — созвон «%s» пропущен", room)
+            return
+
+        # Новый созвон.
+        recorded = self.cfg.auto_record
+        call_dir: Path | None = None
+        if recorded:
+            stamp = datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
+            call_dir = self.cfg.records_dir / f"{stamp}_{safe_name(room)}"
+            call_dir.mkdir(parents=True, exist_ok=True)
+        call_id = self.storage.create_call(
+            room=room, url=snap["url"], tab_id=tab_id, started_ts=now,
+            recorded=recorded, call_dir=str(call_dir) if call_dir else None)
+        c = ActiveCall(call_id=call_id, tab_id=tab_id, room=room, url=snap["url"],
+                       title=snap["title"], started_ts=now, call_dir=call_dir,
+                       recorded=recorded)
+        self.call = c
+        self.storage.add_event(call_id, now, "conference_joined",
+                               {"room": room, "url": snap["url"], "via": snap.get("via")})
+        log.info("Созвон начался: «%s» (#%d), запись=%s", room, call_id, recorded)
+        if c.call_dir is not None:
+            # Пишем сразу, чтобы meta.json пережил аварийное завершение записи
+            # (при финализации файл перезапишется полными данными).
+            self._write_meta(call_id, c.call_dir)
+        if recorded:
+            try:
+                await asyncio.to_thread(self._start_media, c)
+            except Exception:
+                log.exception("Не удалось запустить запись")
+                self.storage.add_event(call_id, time.time(), "record_start_failed", None)
+            self.notify("Запись началась", f"Созвон «{room}»")
+        else:
+            self.notify("Созвон начался", f"«{room}» (журнал без записи)")
+        self._refresh_tray()
+
+    async def _on_unjoined(self, tab_id: int, now: float, reason: str) -> None:
+        c = self.call
+        if c and c.tab_id == tab_id and c.state == "active":
+            await self._enter_grace(c, reason, now)
+        lo = self.log_only.pop(tab_id, None)
+        if lo:
+            self._close_log_only(lo, now, reason)
+
+    async def _enter_grace(self, c: ActiveCall, reason: str, now: float) -> None:
+        c.state = "grace"
+        c.left_ts = now
+        self.storage.add_event(c.call_id, now, "conference_left", {"reason": reason})
+        log.info("Выход из созвона «%s» (%s) — grace %.0f с", c.room, reason,
+                 self.cfg.grace_seconds)
+        self._refresh_tray()
+        if self._grace_task:
+            self._grace_task.cancel()
+        self._grace_task = asyncio.create_task(self._grace_timer(c, reason))
+
+    async def _grace_timer(self, c: ActiveCall, reason: str) -> None:
+        current = asyncio.current_task()
+        try:
+            await asyncio.sleep(self.cfg.grace_seconds)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._grace_task is current:
+                self._grace_task = None
+        if self.call is c and c.state == "grace":
+            self._schedule_finalize(c, reason)
+
+    # ------------------------------------------------------------- watchdog
+
+    async def check_timeouts(self) -> None:
+        """Вызывается периодически: закрывает сессии без heartbeat (Chrome убит)."""
+        now_m = time.monotonic()
+        now = time.time()
+        c = self.call
+        if c and c.state == "active":
+            ts = self.tabs.get(c.tab_id)
+            if ts is None or now_m - ts.last_seen > self.cfg.heartbeat_timeout:
+                log.warning("Heartbeat от вкладки %d пропал — закрываю сессию", c.tab_id)
+                await self._enter_grace(c, "timeout", now)
+        for tab_id, lo in list(self.log_only.items()):
+            ts = self.tabs.get(tab_id)
+            if ts is None or now_m - ts.last_seen > self.cfg.heartbeat_timeout:
+                self.log_only.pop(tab_id, None)
+                self._close_log_only(lo, now, "timeout")
+        # Подчистка давно молчащих вкладок.
+        for tab_id in [t for t, ts in self.tabs.items()
+                       if now_m - ts.last_seen > 10 * self.cfg.heartbeat_timeout]:
+            self.tabs.pop(tab_id, None)
+
+    # ------------------------------------------------------------- запись
+
+    def _start_media(self, c: ActiveCall) -> None:
+        """Запускает рекордеры (вызывается в отдельном потоке)."""
+        assert c.call_dir is not None
+        c.seglog = SegmentLog(c.call_dir / "segments.json")
+        c.rec_mic = AudioRecorder(c.call_dir, "mic", c.seglog, self._thread_event(c.call_id))
+        c.rec_spk = AudioRecorder(c.call_dir, "speakers", c.seglog, self._thread_event(c.call_id))
+        c.rec_mic.start()
+        c.rec_spk.start()
+        if self.cfg.video_enabled:
+            c.rec_video = VideoRecorder(c.call_dir, self.cfg, c.seglog,
+                                        self._thread_event(c.call_id))
+            c.rec_video.start(self._needles(c))
+
+    def _needles(self, c: ActiveCall) -> list[str]:
+        out = []
+        t = strip_chrome_suffix(c.title).strip()
+        if len(t) >= 4:
+            out.append(t)
+        if c.room and len(c.room) >= 4:
+            out.append(c.room)
+        return out or [c.room or "Jitsi Meet"]
+
+    def _thread_event(self, call_id: int):
+        """Колбэк для рекордеров (из их потоков): событие в журнал через loop."""
+        loop = self._loop
+
+        def cb(etype: str, payload: dict | None) -> None:
+            if loop is None or loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(self.storage.add_event, call_id,
+                                          time.time(), etype, payload)
+            except RuntimeError:
+                pass  # loop уже закрыт
+
+        return cb
+
+    def _stop_media(self, c: ActiveCall) -> None:
+        """Останавливает рекордеры (в отдельном потоке); сегменты уже в seglog."""
+        for rec in (c.rec_video, c.rec_mic, c.rec_spk):
+            if rec is not None:
+                try:
+                    rec.stop()
+                except Exception:
+                    log.exception("Ошибка остановки рекордера %r", rec)
+
+    # ------------------------------------------------------------- детали
+
+    def _update_call_details(self, c: ActiveCall, snap: dict, now: float) -> None:
+        if snap["title"] and snap["title"] != c.title:
+            c.title = snap["title"]
+            if c.rec_video:
+                c.rec_video.update_needles(self._needles(c))
+        self._diff_participants(c.call_id, c.participants, snap.get("participants"), now)
+        muted = snap.get("audioMuted")
+        if muted is not None and muted != c.audio_muted:
+            first_known = c.audio_muted is None
+            c.audio_muted = muted
+            if muted:
+                c.mute_open_ts = now
+                self.storage.add_event(c.call_id, now, "mic_muted", None)
+            elif not first_known:  # переход из «неизвестно» в False — не событие
+                if c.mute_open_ts is not None:
+                    c.mute_intervals.append((c.mute_open_ts, now))
+                    c.mute_open_ts = None
+                self.storage.add_event(c.call_id, now, "mic_unmuted", None)
+
+    def _update_log_only(self, lo: LogOnlyCall, snap: dict, now: float) -> None:
+        self._diff_participants(lo.call_id, lo.participants, snap.get("participants"), now)
+
+    def _diff_participants(self, call_id: int, current: dict[str, dict],
+                           new_list, now: float) -> None:
+        if not isinstance(new_list, list):
+            return
+        new = {}
+        for p in new_list:
+            if isinstance(p, dict) and p.get("id"):
+                pid = str(p["id"])
+                new[pid] = {"name": str(p.get("name") or ""),
+                            "local": bool(p.get("local"))}
+        for pid, info in new.items():
+            old = current.get(pid)
+            if old is None:
+                self.storage.participant_joined(call_id, pid, info["name"],
+                                                info["local"], now)
+                self.storage.add_event(call_id, now, "participant_joined",
+                                       {"id": pid, "name": info["name"],
+                                        "local": info["local"]})
+            elif info["name"] and old.get("name") != info["name"]:
+                self.storage.participant_joined(call_id, pid, info["name"],
+                                                info["local"], now)  # обновит имя
+        for pid in list(current.keys() - new.keys()):
+            name = current[pid].get("name", "")
+            self.storage.participant_left(call_id, pid, now)
+            self.storage.add_event(call_id, now, "participant_left",
+                                   {"id": pid, "name": name})
+        current.clear()
+        current.update(new)
+
+    def _close_log_only(self, lo: LogOnlyCall, now: float, reason: str) -> None:
+        self.storage.close_open_participants(lo.call_id, now)
+        self.storage.finish_call(lo.call_id, now, lo.started_ts, reason)
+        self.storage.set_call_status(lo.call_id, "done")
+
+    # ------------------------------------------------------------- финализация
+
+    @staticmethod
+    def _track_task(task: asyncio.Task, registry: set[asyncio.Task],
+                    label: str) -> asyncio.Task:
+        """Держит сильную ссылку на задачу и забирает её исключение."""
+        registry.add(task)
+
+        def done(finished: asyncio.Task) -> None:
+            registry.discard(finished)
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                log.error("Фоновая задача «%s» завершилась с ошибкой",
+                          label,
+                          exc_info=(type(exc), exc, exc.__traceback__))
+
+        task.add_done_callback(done)
+        return task
+
+    def _schedule_finalize(self, c: ActiveCall, reason: str) -> asyncio.Task | None:
+        """Отделяет медиасборку от grace-таймера, чтобы её нельзя было отменить."""
+        if c.state == "finalizing":
+            return None
+        c.state = "finalizing"
+        if self.call is c:
+            self.call = None
+        task = asyncio.create_task(
+            self._finalize(c, reason), name=f"finalize-{c.call_id}")
+        return self._track_task(task, self._finalize_tasks,
+                                f"финализация #{c.call_id}")
+
+    def _schedule_postprocess(self, c: ActiveCall) -> None:
+        if self._shutting_down:
+            return
+        task = asyncio.create_task(
+            self._postprocess(c), name=f"postprocess-{c.call_id}")
+        self._track_task(task, self._postprocess_tasks,
+                         f"постобработка #{c.call_id}")
+
+    async def _finalize(self, c: ActiveCall, reason: str) -> None:
+        end_ts = c.left_ts or time.time()
+        if c.mute_open_ts is not None:
+            c.mute_intervals.append((c.mute_open_ts, end_ts))
+            c.mute_open_ts = None
+        self.storage.close_open_participants(c.call_id, end_ts)
+        self.storage.finish_call(c.call_id, end_ts, c.started_ts, reason)
+        dur = int(end_ts - c.started_ts)
+        log.info("Созвон «%s» завершён (%s), длительность %d:%02d",
+                 c.room, reason, dur // 60, dur % 60)
+        self.set_tray("finalizing", f"«{c.room}»: сборка записи…")
+
+        if c.recorded and c.call_dir is not None:
+            self.storage.set_call_status(c.call_id, "finalizing")
+            await asyncio.to_thread(self._stop_media, c)
+            finalized = False
+            try:
+                mute = c.mute_intervals if self.cfg.respect_mic_mute else []
+                result = await mux.finalize_call(self.cfg, c.call_dir,
+                                                 SegmentLog.load(c.call_dir / "segments.json"),
+                                                 mute)
+                self.storage.set_call_files(c.call_id, **result)
+                self.storage.set_call_status(c.call_id, "done")
+                finalized = True
+                self.notify("Запись сохранена",
+                            f"«{c.room}» · {dur // 60} мин {dur % 60} с")
+            except Exception as e:
+                log.exception("Ошибка финализации записи #%d", c.call_id)
+                self.storage.set_call_status(c.call_id, "error", error=str(e))
+                self.notify("Ошибка сборки записи", f"«{c.room}»: {e}")
+        else:
+            self.storage.set_call_status(c.call_id, "done")
+            self.notify("Созвон завершён", f"«{c.room}» · {dur // 60} мин {dur % 60} с")
+
+        if c.call_dir is not None:
+            self._write_meta(c.call_id, c.call_dir)
+        self._refresh_tray()
+        # Долгую сетевую постобработку не держим внутри задачи медиасборки:
+        # при выходе ждём только безопасного закрытия и сборки локальных файлов.
+        if (c.recorded and c.call_dir is not None and finalized
+                and self.cfg.tr_enabled and reason != "app_exit"):
+            self._schedule_postprocess(c)
+
+    async def _postprocess(self, c: ActiveCall) -> None:
+        assert c.call_dir is not None
+        try:
+            if self.call is None:
+                self.set_tray("transcribing",
+                              f"«{c.room}»: распознавание речи…")
+            text = await transcribe.transcribe_call(
+                self.cfg, self.storage, c.call_id, c.call_dir,
+                c.room, self.notify)
+            if text:
+                await summarize.maybe_summarize(
+                    self.cfg, self.storage, c.call_id, c.call_dir, c.room,
+                    self.notify,
+                    set_tray=self.set_tray if self.call is None else None,
+                    transcript=text)
+        finally:
+            self._write_meta(c.call_id, c.call_dir)
+            self._refresh_tray()
+
+    def _write_meta(self, call_id: int, call_dir: Path) -> None:
+        try:
+            row = self.storage.get_call(call_id)
+            if row is None:
+                return
+            meta = {
+                "call": dict(row),
+                "participants": [dict(r) for r in self.storage.call_participants(call_id)],
+                "events": [dict(r) for r in self.storage.call_events(call_id)],
+            }
+            (call_dir / "meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            log.exception("Не удалось записать meta.json для #%d", call_id)
+
+    # ------------------------------------------------------------- сервис
+
+    def set_paused(self, paused: bool) -> None:
+        self.paused = paused
+        log.info("Пауза обнаружения: %s", paused)
+        self._refresh_tray()
+
+    def begin_shutdown(self) -> None:
+        """Запрещает новым WS-сообщениям создавать сессии при остановке."""
+        self._shutting_down = True
+
+    async def shutdown(self) -> None:
+        """Дожидается локальной медиасборки и отменяет только сетевые задачи."""
+        self.begin_shutdown()
+        if self._grace_task:
+            grace_task = self._grace_task
+            self._grace_task = None
+            grace_task.cancel()
+            await asyncio.gather(grace_task, return_exceptions=True)
+        c = self.call
+        if c is not None and c.state in ("active", "grace"):
+            if c.left_ts is None:
+                c.left_ts = time.time()
+            self._schedule_finalize(c, "app_exit")
+        for tab_id, lo in list(self.log_only.items()):
+            self._close_log_only(lo, time.time(), "app_exit")
+        self.log_only.clear()
+        if self._finalize_tasks:
+            await asyncio.gather(*list(self._finalize_tasks),
+                                 return_exceptions=True)
+        for task in list(self._postprocess_tasks):
+            task.cancel()
+        if self._postprocess_tasks:
+            await asyncio.gather(*list(self._postprocess_tasks),
+                                 return_exceptions=True)
+
+    def _refresh_tray(self) -> None:
+        c = self.call
+        if c is None:
+            if self.paused:
+                self.set_tray("paused", "Пауза обнаружения")
+            else:
+                self.set_tray("idle", "Ожидание созвона")
+        elif c.state == "grace":
+            self.set_tray("grace", f"«{c.room}»: ожидание возврата…")
+        elif c.state == "finalizing":
+            self.set_tray("finalizing", f"«{c.room}»: сборка записи…")
+        elif c.recorded:
+            self.set_tray("recording", f"«{c.room}»: идёт запись")
+        else:
+            self.set_tray("logging", f"«{c.room}»: журнал (без записи)")

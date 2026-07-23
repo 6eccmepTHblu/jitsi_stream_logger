@@ -1,0 +1,28 @@
+{
+    "manifest_version": 3,
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA8TukCiVvUASc3Yjq2Hk5XxVd0oH5i90NqAgkUR4MCIiuN1K5Ts8YhnrOgHbiaWjyq5qQ9BWwkMjq3MkcpN38CnN4r+ASaqjrSXBv+PCV12T5aKnunnrk0dm/50qR1xT46DeaSa2y4GXqIcHwLKMcl+ZtpSUwd2Kk8mF6C8VfFCu1U1oXxa6FVIK3Ax+ZQ6iOWOq4Wo4MjiuFs8MOyiaGLo+Af6HfBV5t0r6J6xh0ORAliiefaUMt3snc1m9E1FCDDmv/2uJ3/i+JrIH3Jp/1sZg6bF66tXgSyWQWusKS4W2LO/N8ORBaaGDrFDGqKQFRGKWVThSFt0zyk4Y29qYiWQIDAQAB",
+    "name": "Jitsi Stream Logger Bridge",
+    "version": "1.1.0",
+    "description": "Сообщает локальному приложению Jitsi Stream Logger о созвонах Jitsi Meet (только на разрешённых доменах).",
+    "minimum_chrome_version": "116",
+    "background": {
+        "service_worker": "sw.js"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "https://meet.jit.si/*"
+            ],
+            "js": ["page-hook.js"],
+            "run_at": "document_idle",
+            "world": "MAIN"
+        },
+        {
+            "matches": [
+                "https://meet.jit.si/*"
+            ],
+            "js": ["bridge.js"],
+            "run_at": "document_idle"
+        }
+    ]
+}
