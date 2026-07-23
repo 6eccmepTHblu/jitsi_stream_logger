@@ -118,14 +118,19 @@ def run(cfg, transcript: str, room: str = "", started_at: str = "") -> str:
     return str(text).strip() + "\n"
 
 
-async def maybe_summarize(cfg, storage, call_id: int, call_dir: Path,
-                          room: str, notify, set_tray=None,
+async def maybe_summarize(cfg, call, notify, set_tray=None,
                           transcript: str | None = None,
                           force: bool = False) -> None:
     """Резюме после транскрипции (если включено; force — по явному запросу
-    пользователя, независимо от настройки). Ошибки не роняют пайплайн."""
+    пользователя, независимо от настройки). Ошибки не роняют пайплайн.
+
+    `call` — CallLog записи."""
+    from app import records
+
     if not (cfg.sum_enabled or force):
         return
+    call_dir = call.call_dir
+    room = call.room
     if transcript is None:
         tp = call_dir / "transcript.txt"
         if not tp.exists():
@@ -133,30 +138,30 @@ async def maybe_summarize(cfg, storage, call_id: int, call_dir: Path,
         transcript = tp.read_text(encoding="utf-8")
     if not transcript.strip():
         return
-    previous_status = storage.begin_processing(call_id, "summarizing")
-    if previous_status is None:
-        log.info("Резюме для записи #%d не запущено: запись удалена или занята",
-                 call_id)
+    if not records.try_acquire(call_dir):
+        log.info("Резюме для «%s» не запущено: запись уже обрабатывается", room)
         return
+    previous_status = call.status
+    call.set_status("summarizing")
+    call.write()
     try:
-        row = storage.get_call(call_id)
-        started = ((row["started_at"] or "")[:16].replace("T", " ")
-                   if row else "")
+        started = (call.started_at or "")[:16].replace("T", " ")
         if set_tray is not None:
             set_tray("transcribing", f"«{room}»: составление резюме…")
-        storage.add_event(call_id, time.time(), "summary_started", None)
+        call.add_event(time.time(), "summary_started", None)
+        call.write()
         try:
             text = await workers.run_daemon(run, cfg, transcript, room, started)
             spath = call_dir / "summary.txt"
             spath.write_text(text, encoding="utf-8")
-            storage.set_call_files(call_id, summary_path=str(spath))
-            storage.add_event(call_id, time.time(), "summary_done",
-                              {"chars": len(text)})
+            call.set_files(summary_path=str(spath))
+            call.add_event(time.time(), "summary_done", {"chars": len(text)})
             notify("Резюме готово", f"«{room}» → summary.txt")
         except Exception as e:
-            log.exception("Ошибка резюме созвона #%d", call_id)
-            storage.add_event(call_id, time.time(), "summary_failed",
-                              {"error": str(e)})
+            log.exception("Ошибка резюме созвона «%s»", room)
+            call.add_event(time.time(), "summary_failed", {"error": str(e)})
             notify("Ошибка резюме", f"«{room}»: {e}")
     finally:
-        storage.finish_processing(call_id, "summarizing", previous_status)
+        call.set_status(previous_status)
+        call.write()
+        records.release(call_dir)

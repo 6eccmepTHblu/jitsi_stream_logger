@@ -12,15 +12,15 @@
 from __future__ import annotations
 
 import os
-import sqlite3
+import shutil
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from app import autostart, summarize, transcribe
+from app import autostart, records, summarize, transcribe
 from app.config import APP_TITLE, appdata_dir, load_config, set_config_value
 
-DELETABLE_STATUSES = {"done", "log_only", "error"}
+DELETABLE_STATUSES = records.DELETABLE_STATUSES
 
 
 def _monitor_count() -> int:
@@ -30,53 +30,6 @@ def _monitor_count() -> int:
         return max(1, int(win32api.GetSystemMetrics(80)))  # SM_CMONITORS
     except Exception:
         return 1
-
-
-def _load_calls() -> list[sqlite3.Row]:
-    db = appdata_dir() / "calls.db"
-    if not db.exists():
-        return []
-    try:
-        conn = sqlite3.connect(db, timeout=3)
-        conn.row_factory = sqlite3.Row
-        try:
-            return conn.execute(
-                "SELECT id, room, started_at, duration_sec, status, dir, "
-                "transcript_path, summary_path FROM calls "
-                "ORDER BY id DESC LIMIT 300"
-            ).fetchall()
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return []
-
-
-def _delete_call_db(call_id: int) -> bool:
-    """Удаляет запись созвона и связанные строки из журнала.
-
-    Отдельный процесс окна настроек пишет в ту же calls.db, что и основное
-    приложение (WAL допускает конкурентную запись); короткий таймаут — на случай,
-    если основное приложение как раз держит короткий write-lock.
-    """
-    db = appdata_dir() / "calls.db"
-    conn = sqlite3.connect(db, timeout=5)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT status FROM calls WHERE id=?", (call_id,)).fetchone()
-        if row is None or str(row[0]).lower() not in DELETABLE_STATUSES:
-            conn.rollback()
-            return False
-        conn.execute("DELETE FROM events WHERE call_id=?", (call_id,))
-        conn.execute("DELETE FROM participants WHERE call_id=?", (call_id,))
-        conn.execute("DELETE FROM calls WHERE id=?", (call_id,))
-        conn.commit()
-        return True
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 # --------------------------------------------------------------- вкладка 1
@@ -308,32 +261,31 @@ def _build_records_tab(frm: ttk.Frame, cfg) -> None:
     frm.rowconfigure(0, weight=1)
     frm.columnconfigure(0, weight=1)
 
-    rows_cache: dict[int, sqlite3.Row] = {}
+    rows_cache: dict[str, dict] = {}
 
     def refresh() -> None:
         tree.delete(*tree.get_children())
         rows_cache.clear()
-        for r in _load_calls():
-            rows_cache[int(r["id"])] = r
+        for r in records.scan_records(cfg.records_dir):
+            d = Path(r["dir"])
+            rows_cache[r["dir"]] = r
             start = (r["started_at"] or "")[:16].replace("T", " ")
             dur = divmod(int(r["duration_sec"] or 0), 60)
-            has_tr = bool(r["transcript_path"]
-                          and Path(r["transcript_path"]).exists())
-            has_sum = bool(r["summary_path"]
-                           and Path(r["summary_path"]).exists())
-            tree.insert("", "end", iid=str(r["id"]),
+            has_tr = (d / "transcript.txt").exists()
+            has_sum = (d / "summary.txt").exists()
+            tree.insert("", "end", iid=r["dir"],
                         values=(start, r["room"] or "",
                                 f"{dur[0]}:{dur[1]:02d}",
                                 r["status"] or "",
                                 "есть" if has_tr else "",
                                 "есть" if has_sum else ""))
 
-    def selected() -> sqlite3.Row | None:
+    def selected() -> dict | None:
         sel = tree.selection()
         if not sel:
             messagebox.showinfo(APP_TITLE, "Сначала выберите запись в списке")
             return None
-        return rows_cache.get(int(sel[0]))
+        return rows_cache.get(sel[0])
 
     def open_folder(_event=None) -> None:
         r = selected()
@@ -343,8 +295,8 @@ def _build_records_tab(frm: ttk.Frame, cfg) -> None:
             os.startfile(r["dir"])  # noqa: S606
         else:
             messagebox.showwarning(
-                APP_TITLE, "У этой записи нет папки с файлами\n"
-                           "(журнал без записи или файлы удалены).")
+                APP_TITLE, "Папка этой записи не найдена\n"
+                           "(возможно, удалена).")
 
     def _queued_info(what: str) -> None:
         messagebox.showinfo(
@@ -357,7 +309,7 @@ def _build_records_tab(frm: ttk.Frame, cfg) -> None:
     def _check_dir(r) -> Path | None:
         if not r["dir"] or not Path(r["dir"]).exists():
             messagebox.showwarning(APP_TITLE,
-                                   "У этой записи нет папки с файлами.")
+                                   "Папка этой записи не найдена.")
             return None
         return Path(r["dir"])
 
@@ -374,7 +326,7 @@ def _build_records_tab(frm: ttk.Frame, cfg) -> None:
                 APP_TITLE, "В папке записи нет аудио для распознавания\n"
                            f"({audio.name}).")
             return
-        transcribe.enqueue(int(r["id"]), "stt")
+        transcribe.enqueue(r["dir"], "stt")
         _queued_info("Транскрибация добавлена в очередь.")
 
     def send_summary() -> None:
@@ -385,7 +337,7 @@ def _build_records_tab(frm: ttk.Frame, cfg) -> None:
         if d is None:
             return
         if (d / "transcript.txt").exists():
-            transcribe.enqueue(int(r["id"]), "summary")
+            transcribe.enqueue(r["dir"], "summary")
             _queued_info("Резюме по транскрипту добавлено в очередь.")
             return
         audio = transcribe.pick_audio(cfg, d)
@@ -399,7 +351,7 @@ def _build_records_tab(frm: ttk.Frame, cfg) -> None:
                 "Транскрипта у этой записи ещё нет.\n\n"
                 "Сначала распознать речь, а затем автоматически "
                 "составить резюме?"):
-            transcribe.enqueue(int(r["id"]), "stt_summary")
+            transcribe.enqueue(r["dir"], "stt_summary")
             _queued_info("Транскрибация с последующим резюме добавлена "
                          "в очередь.")
 
@@ -407,48 +359,61 @@ def _build_records_tab(frm: ttk.Frame, cfg) -> None:
         r = selected()
         if r is None:
             return
+        if not r.get("owned"):
+            messagebox.showwarning(
+                APP_TITLE,
+                "У записи нет подтверждённого маркера Jitsi Stream Logger. "
+                "Удаление заблокировано.")
+            return
         status = (r["status"] or "").lower()
-        if status not in DELETABLE_STATUSES:
+        if status not in DELETABLE_STATUSES or not r.get("ended_at"):
             messagebox.showwarning(
                 APP_TITLE, "Эта запись ещё идёт, собирается или обрабатывается — "
                            "дождитесь завершения, затем удаляйте.")
             return
         d = r["dir"]
-        has_folder = bool(d) and Path(d).exists()
+        if not d or not Path(d).exists():
+            refresh()
+            return
         when = (r["started_at"] or "")[:16].replace("T", " ")
-        detail = (f"Папка будет удалена безвозвратно:\n{d}" if has_folder
-                  else "Папки с файлами нет — удалится только запись в журнале.")
         if not messagebox.askyesno(
                 APP_TITLE,
-                f"Удалить запись «{r['room'] or ''}» от {when}?\n\n{detail}\n\n"
+                f"Удалить запись «{r['room'] or ''}» от {when}?\n\n"
+                f"Папка будет удалена безвозвратно:\n{d}\n\n"
                 "Отменить будет нельзя.",
                 icon="warning", default="no"):
             return
-        # Сначала журнал: если строку убрать не удалось, папку не трогаем —
-        # иначе запись «зависает» в списке и её больше нельзя удалить.
-        try:
-            deleted = _delete_call_db(int(r["id"]))
-        except sqlite3.Error as e:
-            messagebox.showerror(APP_TITLE,
-                                 f"Не удалось удалить запись из журнала:\n{e}")
-            return
-        if not deleted:
+        call_dir = Path(d)
+        if not records.try_acquire(call_dir):
             messagebox.showwarning(
                 APP_TITLE,
-                "Статус записи изменился: она сейчас обрабатывается или уже "
-                "удалена. Обновите список.")
+                "Запись прямо сейчас обрабатывается. Дождитесь завершения "
+                "транскрипции или резюме.")
             refresh()
             return
-        if has_folder:
-            import shutil
-
+        try:
+            # Статус перечитываем уже под межпроцессной блокировкой: значение
+            # из rows_cache могло устареть, пока пользователь читал диалог.
+            meta = records.read_meta(call_dir)
+            current = (meta.get("call") if meta else None) or {}
+            current_status = str(current.get("status") or "").lower()
+            if (not records.is_owned_meta(meta)
+                    or current_status not in DELETABLE_STATUSES
+                    or not current.get("ended_at")):
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Статус записи изменился или её журнал повреждён. "
+                    "Удаление отменено.")
+                return
             try:
-                shutil.rmtree(d)
+                shutil.rmtree(call_dir)
             except OSError as e:
                 messagebox.showwarning(
                     APP_TITLE,
-                    f"Запись убрана из журнала, но папку удалить не удалось:\n{e}\n\n"
+                    f"Не удалось удалить папку записи:\n{e}\n\n"
                     f"Удалите вручную:\n{d}")
+        finally:
+            records.release(call_dir)
         refresh()
 
     tree.bind("<Double-1>", open_folder)
@@ -464,7 +429,7 @@ def _build_records_tab(frm: ttk.Frame, cfg) -> None:
     ttk.Button(btns, text="Удалить", command=delete_call).grid(
         row=0, column=3, padx=(0, 6))
     ttk.Button(btns, text="Обновить", command=refresh).grid(row=0, column=4)
-    ttk.Label(frm, text=f"Журнал: {appdata_dir() / 'calls.db'}",
+    ttk.Label(frm, text=f"Папка записей: {cfg.records_dir}",
               foreground="#777").grid(row=2, column=0, columnspan=2,
                                       sticky="w", pady=(6, 0))
     refresh()

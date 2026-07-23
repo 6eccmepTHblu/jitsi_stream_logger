@@ -13,12 +13,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from app import summarize, transcribe
+from app import records, summarize, transcribe
 from app.config import Config, load_config
+from app.records import CallLog
 from app.recorder import mux
 from app.recorder.segments import SegmentLog
 from app.session import SessionManager
-from app.storage import Storage
 from app.ws_server import WsServer
 
 log = logging.getLogger(__name__)
@@ -37,7 +37,6 @@ class App:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.tray = None  # присваивается в main до tray.run()
-        self.storage: Storage | None = None
         self.sm: SessionManager | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.fatal: str | None = None
@@ -122,12 +121,22 @@ class App:
     async def _amain(self) -> None:
         self.loop = asyncio.get_running_loop()
         self._stop_evt = asyncio.Event()
-        self._migrate_db()
-        self.storage = Storage(self.cfg.db_path)
+        try:
+            migrated, archived = transcribe.migrate_legacy_queue(
+                (self.cfg.appdata_dir / "calls.db",
+                 self.cfg.records_dir / "calls.db"))
+            if migrated:
+                log.info("Перенесено старых задач STT/резюме: %d", migrated)
+            if archived:
+                log.warning(
+                    "Не удалось сопоставить %d старых задач; они сохранены в %s",
+                    archived, transcribe.legacy_queue_path())
+        except OSError:
+            log.exception("Не удалось мигрировать старую очередь задач")
         # Снимок делаем до открытия WS: новые сессии этого запуска не должны
         # ошибочно считаться оборванными и попадать в recovery.
-        stale_rows = self.storage.stale_calls()
-        self.sm = SessionManager(self.cfg, self.storage,
+        stale_dirs = records.find_interrupted(self.cfg.records_dir)
+        self.sm = SessionManager(self.cfg,
                                  notify=self.notify, set_tray=self.set_tray_state)
         self._retention_changed = asyncio.Event()
         ws = WsServer(self.cfg.ws_port, self.sm)
@@ -139,7 +148,7 @@ class App:
             log.error(self.fatal)
             self._ready.set()
             return
-        reset_count = self.storage.reset_interrupted_processing()
+        reset_count = records.reset_interrupted_processing(self.cfg.records_dir)
         if reset_count:
             log.info("Освобождено оборванных задач STT/резюме: %d",
                      reset_count)
@@ -151,7 +160,7 @@ class App:
             asyncio.create_task(self._retention(), name="retention"),
         ]
         recovery_task = asyncio.create_task(
-            self._startup_recovery(stale_rows), name="recovery")
+            self._startup_recovery(stale_dirs), name="recovery")
 
         await self._stop_evt.wait()
         log.info("Завершение работы…")
@@ -176,21 +185,9 @@ class App:
         if self._postprocess_tasks:
             await asyncio.gather(*list(self._postprocess_tasks),
                                  return_exceptions=True)
-        self.storage.close()
         log.info("Приложение остановлено")
         if self.tray is not None:
             self.tray.stop()
-
-    def _migrate_db(self) -> None:
-        """Ранние версии держали calls.db в папке записей — переносим в APPDATA."""
-        old_db = self.cfg.records_dir / "calls.db"
-        if self.cfg.db_path.exists() or not old_db.exists():
-            return
-        for suffix in ("", "-wal", "-shm"):
-            src = Path(str(old_db) + suffix)
-            if src.exists():
-                shutil.move(str(src), str(self.cfg.db_path) + suffix)
-        log.info("БД журнала перенесена: %s -> %s", old_db, self.cfg.db_path)
 
     # ------------------------------------------------- фоновые задачи
 
@@ -245,16 +242,19 @@ class App:
                  self.cfg.video_monitor, self.cfg.tr_enabled)
         self.sm._refresh_tray()
 
-    async def _startup_recovery(self, stale_rows: list) -> None:
+    async def _startup_recovery(self, stale_dirs: list[Path]) -> None:
         """Финализирует записи, оборванные падением приложения/системы."""
         await asyncio.sleep(2)
-        for row in stale_rows:
-            call_id = row["id"]
+        for call_dir in stale_dirs:
+            call = CallLog.from_dir(call_dir)
+            if call is None:
+                continue
             try:
-                await self._recover_one(row)
+                await self._recover_one(call)
             except Exception as e:
-                log.exception("Не удалось восстановить запись #%d", call_id)
-                self.storage.set_call_status(call_id, "error", error=f"recovery: {e}")
+                log.exception("Не удалось восстановить запись %s", call_dir.name)
+                call.set_status("error", error=f"recovery: {e}")
+                call.write()
         if transcribe.queue_path().exists():
             self._ensure_queue_task()
 
@@ -301,24 +301,23 @@ class App:
             self.sm._refresh_tray()
 
     async def _process_queue_task(self, task: dict) -> bool:
-        call_id, action = task["call_id"], task["action"]
+        raw_dir, action = task.get("dir"), task["action"]
         if action not in ("stt", "summary", "stt_summary"):
             log.warning("Очередь задач: неизвестное действие %r — пропуск", action)
             return True
-        row = self.storage.get_call(call_id)
-        if row is None or not row["dir"] or not Path(row["dir"]).exists():
-            log.warning("Очередь задач: запись #%s без папки — пропуск", call_id)
+        call_dir = Path(raw_dir) if raw_dir else None
+        call = CallLog.from_dir(call_dir) if call_dir else None
+        if call is None or not call_dir.exists():
+            log.warning("Очередь задач: запись %s без папки — пропуск", raw_dir)
             return True
-        if row["status"] in ("recording", "finalizing",
-                             "transcribing", "summarizing"):
-            log.info("Очередь задач: запись #%d ещё занята (%s) — отложено",
-                     call_id, row["status"])
+        if call.status in ("recording", "finalizing",
+                           "transcribing", "summarizing"):
+            log.info("Очередь задач: запись «%s» ещё занята (%s) — отложено",
+                     call.room, call.status)
             return False
-        room = row["room"] or ""
-        call_dir = Path(row["dir"])
+        room = call.room
         tray = (self.set_tray_state if self.sm.call is None else None)
-        log.info("Очередь задач: %s для записи #%d («%s»)",
-                 action, call_id, room)
+        log.info("Очередь задач: %s для записи «%s»", action, room)
 
         if action == "summary":
             tp = call_dir / "transcript.txt"
@@ -328,57 +327,65 @@ class App:
                             f"выполните транскрибацию")
                 return True
             await summarize.maybe_summarize(
-                self.cfg, self.storage, call_id, call_dir, room,
-                self.notify, set_tray=tray, force=True)
+                self.cfg, call, self.notify, set_tray=tray, force=True)
             return True
 
         if tray:
             tray("transcribing", f"«{room}»: распознавание речи…")
-        text = await transcribe.transcribe_call(
-            self.cfg, self.storage, call_id, call_dir, room, self.notify)
+        text = await transcribe.transcribe_call(self.cfg, call, self.notify)
         if text:
             await summarize.maybe_summarize(
-                self.cfg, self.storage, call_id, call_dir, room,
-                self.notify, set_tray=tray, transcript=text,
+                self.cfg, call, self.notify, set_tray=tray, transcript=text,
                 force=(action == "stt_summary"))
         return True
 
-    async def _recover_one(self, row) -> None:
-        call_id = row["id"]
-        started_ts = _iso_to_ts(row["started_at"])
-        if not row["recorded"] or not row["dir"]:
-            if not row["ended_at"]:
-                self.storage.finish_call(call_id, started_ts, started_ts, "crash")
-            self.storage.set_call_status(call_id, "done")
+    async def _recover_one(self, call: CallLog) -> None:
+        call_dir = call.call_dir
+        started_ts = _iso_to_ts(call.started_at)
+        if not call.recorded or call_dir is None:
+            end_ts = started_ts
+            if call_dir is not None:
+                try:
+                    end_ts = max(started_ts,
+                                 (call_dir / records.META_NAME).stat().st_mtime)
+                except OSError:
+                    pass
+            if not call.ended_at:
+                call.finish(end_ts, started_ts, "crash")
+            call.close_open_participants(end_ts)
+            call.set_status("done")
+            call.add_event(time.time(), "recovered_after_crash", None)
+            call.write()
             return
-        call_dir = Path(row["dir"])
         seg = SegmentLog.load(call_dir / "segments.json")
         files = [call_dir / s["path"] for s in seg["audio"] + seg["video"]
                  if (call_dir / s["path"]).exists()]
         if not files:
-            if not row["ended_at"]:
-                self.storage.finish_call(call_id, started_ts, started_ts, "crash")
-            self.storage.set_call_status(call_id, "error", error="recovery: нет сегментов")
+            if not call.ended_at:
+                call.finish(started_ts, started_ts, "crash")
+            call.set_status("error", error="recovery: нет сегментов")
+            call.write()
             return
         end_ts = max(f.stat().st_mtime for f in files)
-        if not row["ended_at"]:
-            self.storage.finish_call(call_id, end_ts, started_ts, "crash")
-        self.storage.close_open_participants(call_id, end_ts)
-        log.info("Восстанавливаю запись #%d (%s)", call_id, row["room"])
-        self.storage.set_call_status(call_id, "finalizing")
-        mute = self._mute_intervals_from_events(call_id, end_ts)
+        if not call.ended_at:
+            call.finish(end_ts, started_ts, "crash")
+        call.close_open_participants(end_ts)
+        log.info("Восстанавливаю запись «%s» (%s)", call.room, call_dir.name)
+        call.set_status("finalizing")
+        call.write()
+        mute = self._mute_intervals_from_events(call, end_ts)
         result = await mux.finalize_call(self.cfg, call_dir, seg,
                                          mute if self.cfg.respect_mic_mute else [])
-        self.storage.set_call_files(call_id, **result)
-        self.storage.set_call_status(call_id, "done")
-        self.storage.add_event(call_id, time.time(), "recovered_after_crash", None)
+        call.set_files(**result)
+        call.set_status("done")
+        call.add_event(time.time(), "recovered_after_crash", None)
+        call.write()
         self.notify("Запись восстановлена",
-                    f"«{row['room']}» — собрана после сбоя")
+                    f"«{call.room}» — собрана после сбоя")
         if self.cfg.tr_enabled and result and not self._shutting_down:
             task = asyncio.create_task(
-                self._postprocess_recovered(
-                    call_id, call_dir, row["room"] or ""),
-                name=f"recovery-postprocess-{call_id}")
+                self._postprocess_recovered(call),
+                name=f"recovery-postprocess-{call_dir.name}")
             self._postprocess_tasks.add(task)
 
             def done(finished: asyncio.Task) -> None:
@@ -387,25 +394,23 @@ class App:
                     return
                 exc = finished.exception()
                 if exc is not None:
-                    log.error("Постобработка восстановленной записи #%d упала",
-                              call_id,
+                    log.error("Постобработка восстановленной записи «%s» упала",
+                              call.room,
                               exc_info=(type(exc), exc, exc.__traceback__))
 
             task.add_done_callback(done)
 
-    async def _postprocess_recovered(self, call_id: int, call_dir: Path,
-                                     room: str) -> None:
-        text = await transcribe.transcribe_call(
-            self.cfg, self.storage, call_id, call_dir, room, self.notify)
+    async def _postprocess_recovered(self, call: CallLog) -> None:
+        text = await transcribe.transcribe_call(self.cfg, call, self.notify)
         if text:
             await summarize.maybe_summarize(
-                self.cfg, self.storage, call_id, call_dir, room,
-                self.notify, transcript=text)
+                self.cfg, call, self.notify, transcript=text)
 
-    def _mute_intervals_from_events(self, call_id: int, end_ts: float) -> list:
+    @staticmethod
+    def _mute_intervals_from_events(call: CallLog, end_ts: float) -> list:
         intervals = []
         open_ts: float | None = None
-        for ev in self.storage.call_events(call_id):
+        for ev in call.events:
             if ev["type"] == "mic_muted":
                 open_ts = _iso_to_ts(ev["ts"])
             elif ev["type"] == "mic_unmuted" and open_ts is not None:
@@ -432,7 +437,7 @@ class App:
                 pass
 
     def _run_retention(self, days: int) -> None:
-        """Удаляет только завершённые записи из БД внутри текущей records_dir."""
+        """Удаляет завершённые папки записей старше N дней внутри records_dir."""
         if days <= 0:
             return
         cutoff = time.time() - days * 86400
@@ -440,28 +445,42 @@ class App:
         active_dir = None
         if self.sm.call and self.sm.call.call_dir:
             active_dir = self.sm.call.call_dir.resolve()
-        for row in self.storage.retention_candidates():
-            raw_dir = Path(row["dir"])
+        for raw_dir, _call in records.retention_candidates(self.cfg.records_dir):
             try:
                 call_dir = raw_dir.resolve()
             except OSError:
-                log.warning("Ретеншн: не удалось разрешить путь записи #%d: %s",
-                            row["id"], raw_dir)
+                log.warning("Ретеншн: не удалось разрешить путь записи: %s", raw_dir)
                 continue
-            # Записи приложения всегда лежат непосредственно в records_dir.
-            # Это не даёт ошибочной строке БД удалить произвольное дерево.
+            # Кандидаты — только прямые подпапки records_dir; проверка на всякий
+            # случай не даёт удалить дерево вне текущей папки (симлинки и т.п.).
             if call_dir.parent != records_root:
-                log.warning("Ретеншн: путь записи #%d вне текущей папки — пропуск: %s",
-                            row["id"], call_dir)
                 continue
             if active_dir is not None and call_dir == active_dir:
                 continue
-            ended_ts = _iso_to_ts(row["ended_at"] or row["started_at"])
-            if ended_ts >= cutoff or not call_dir.is_dir():
+            # Захват держим до завершения удаления: GUI и постобработка
+            # используют тот же межпроцессный файловый lock.
+            if not records.try_acquire(call_dir):
                 continue
-            log.info("Ретеншн: удаляю старую запись #%d: %s",
-                     row["id"], call_dir.name)
             try:
-                shutil.rmtree(call_dir)
-            except OSError:
-                log.exception("Ретеншн: не удалось удалить %s", call_dir)
+                meta = records.read_meta(call_dir)
+                if meta is None or not records.is_owned_meta(meta):
+                    continue
+                call = meta.get("call") or {}
+                if str(call.get("status") or "") not in records.DELETABLE_STATUSES:
+                    continue
+                ended_ts = _iso_to_ts(
+                    call.get("ended_at") or call.get("started_at"))
+                if not ended_ts:
+                    try:
+                        ended_ts = call_dir.stat().st_mtime
+                    except OSError:
+                        continue
+                if ended_ts >= cutoff or not call_dir.is_dir():
+                    continue
+                log.info("Ретеншн: удаляю старую запись: %s", call_dir.name)
+                try:
+                    shutil.rmtree(call_dir)
+                except OSError:
+                    log.exception("Ретеншн: не удалось удалить %s", call_dir)
+            finally:
+                records.release(call_dir)

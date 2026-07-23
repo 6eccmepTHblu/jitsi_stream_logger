@@ -20,7 +20,8 @@ DEFAULT_CONFIG_TOML = """\
 # Файл читается при старте приложения.
 
 [general]
-# Папка, куда складываются записи созвонов (и общая БД calls.db).
+# Папка, куда складываются записи созвонов. Журнал каждого созвона лежит
+# рядом с его файлами в meta.json — отдельной БД нет.
 records_dir = "~/Videos/JitsiCalls"
 # Домены Jitsi, на которых реагируем. Для собственного сервера добавьте
 # его домен сюда и в matches файла extension/manifest.json.
@@ -131,7 +132,6 @@ class Config:
     retention_days: int
     appdata_dir: Path
     log_dir: Path
-    db_path: Path
     # Тайминги FSM (в конфиг не выносим, но переопределяемы в тестах).
     heartbeat_timeout: float = 15.0
     grace_seconds: float = 20.0
@@ -197,9 +197,6 @@ def load_config() -> Config:
         retention_days=int(ret.get("days", 0)),
         appdata_dir=adir,
         log_dir=log_dir,
-        # БД журнала лежит в APPDATA, а не в records_dir: смена папки записей
-        # из меню не должна расщеплять журнал.
-        db_path=adir / "calls.db",
     )
 
 

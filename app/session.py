@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import time
@@ -22,11 +21,11 @@ from urllib.parse import urlparse
 
 from app import summarize, transcribe
 from app.config import Config
+from app.records import CallLog
 from app.recorder import mux
 from app.recorder.audio import AudioRecorder
 from app.recorder.segments import SegmentLog
 from app.recorder.video import VideoRecorder
-from app.storage import Storage
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +44,21 @@ def safe_name(s: str, max_len: int = 50) -> str:
     return s[:max_len] or "room"
 
 
+def create_call_dir(records_dir: Path, room: str, started_ts: float) -> Path:
+    """Создаёт уникальную папку журнала, даже если медиа не записывается."""
+    stamp = datetime.fromtimestamp(started_ts).strftime("%Y-%m-%d_%H-%M-%S")
+    base = f"{stamp}_{safe_name(room)}"
+    for index in range(1000):
+        suffix = "" if index == 0 else f"_{index:02d}"
+        candidate = records_dir / f"{base}{suffix}"
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    raise OSError(f"Не удалось подобрать свободную папку для созвона «{room}»")
+
+
 @dataclass
 class TabState:
     snapshot: dict
@@ -53,10 +67,16 @@ class TabState:
 
 @dataclass
 class LogOnlyCall:
-    call_id: int
-    room: str
-    started_ts: float
+    log: CallLog
     participants: dict[str, dict] = field(default_factory=dict)
+
+    @property
+    def room(self) -> str:
+        return self.log.room
+
+    @property
+    def started_ts(self) -> float:
+        return self.log.started_ts
 
 
 @dataclass
@@ -79,13 +99,20 @@ class ActiveCall:
     rec_mic: AudioRecorder | None = None
     rec_spk: AudioRecorder | None = None
     rec_video: VideoRecorder | None = None
+    log: CallLog | None = None
+
+    def __post_init__(self) -> None:
+        if self.log is None:
+            self.log = CallLog(
+                room=self.room, url=self.url, tab_id=self.tab_id,
+                started_ts=self.started_ts, call_dir=self.call_dir,
+                recorded=self.recorded)
 
 
 class SessionManager:
-    def __init__(self, cfg: Config, storage: Storage, *,
-                 notify=None, set_tray=None):
+    def __init__(self, cfg: Config, *, notify=None, set_tray=None):
         self.cfg = cfg
-        self.storage = storage
+        self._seq = 0  # порядковый номер созвона за текущий запуск (для логов)
         # notify(title, msg); set_tray(state, text), state:
         # idle|paused|logging|recording|grace|finalizing|transcribing
         self.notify = notify or (lambda title, msg: None)
@@ -175,22 +202,27 @@ class SessionManager:
                     self._grace_task.cancel()
                     self._grace_task = None
                 c.tab_id = tab_id
+                c.log.tab_id = tab_id
                 c.state = "active"
                 c.left_ts = None
-                self.storage.add_event(c.call_id, now, "rejoined", {"tab_id": tab_id})
+                c.log.add_event(now, "rejoined", {"tab_id": tab_id})
+                c.log.write()
                 log.info("Возврат в созвон «%s» — сессия #%d продолжается", room, c.call_id)
                 self._refresh_tray()
                 return
             if c.tab_id == tab_id and c.state == "active":
                 return  # дубль
-            # Параллельный второй созвон — только журнал.
+            # Параллельный второй созвон — только журнал, но его meta.json
+            # сохраняется так же надёжно, как журнал записываемого созвона.
             if tab_id not in self.log_only:
-                call_id = self.storage.create_call(
-                    room=room, url=snap["url"], tab_id=tab_id, started_ts=now,
-                    recorded=False, call_dir=None)
-                self.log_only[tab_id] = LogOnlyCall(call_id, room, now)
-                self.storage.add_event(call_id, now, "concurrent_conference",
-                                       {"recording_call_id": c.call_id})
+                call_dir = create_call_dir(self.cfg.records_dir, room, now)
+                lo_log = CallLog(room=room, url=snap["url"], tab_id=tab_id,
+                                 started_ts=now, call_dir=call_dir,
+                                 recorded=False)
+                lo_log.add_event(now, "concurrent_conference",
+                                 {"recording_call_id": c.call_id})
+                lo_log.write()
+                self.log_only[tab_id] = LogOnlyCall(lo_log)
                 log.warning("Второй одновременный созвон «%s» — только журнал", room)
                 self.notify("Второй созвон не записывается",
                             f"Идёт запись «{c.room}»; «{room}» попадёт только в журнал")
@@ -202,31 +234,27 @@ class SessionManager:
 
         # Новый созвон.
         recorded = self.cfg.auto_record
-        call_dir: Path | None = None
-        if recorded:
-            stamp = datetime.fromtimestamp(now).strftime("%Y-%m-%d_%H-%M-%S")
-            call_dir = self.cfg.records_dir / f"{stamp}_{safe_name(room)}"
-            call_dir.mkdir(parents=True, exist_ok=True)
-        call_id = self.storage.create_call(
-            room=room, url=snap["url"], tab_id=tab_id, started_ts=now,
-            recorded=recorded, call_dir=str(call_dir) if call_dir else None)
+        call_dir = create_call_dir(self.cfg.records_dir, room, now)
+        self._seq += 1
+        call_id = self._seq
         c = ActiveCall(call_id=call_id, tab_id=tab_id, room=room, url=snap["url"],
                        title=snap["title"], started_ts=now, call_dir=call_dir,
                        recorded=recorded)
         self.call = c
-        self.storage.add_event(call_id, now, "conference_joined",
-                               {"room": room, "url": snap["url"], "via": snap.get("via")})
+        c.log.add_event(now, "conference_joined",
+                        {"room": room, "url": snap["url"], "via": snap.get("via")})
         log.info("Созвон начался: «%s» (#%d), запись=%s", room, call_id, recorded)
-        if c.call_dir is not None:
-            # Пишем сразу, чтобы meta.json пережил аварийное завершение записи
-            # (при финализации файл перезапишется полными данными).
-            self._write_meta(call_id, c.call_dir)
+        # Пишем сразу для любого режима, включая журнал без медиа.
+        if not c.log.write():
+            self.notify("Ошибка журнала",
+                        f"«{room}»: не удалось сохранить meta.json")
         if recorded:
             try:
                 await asyncio.to_thread(self._start_media, c)
             except Exception:
                 log.exception("Не удалось запустить запись")
-                self.storage.add_event(call_id, time.time(), "record_start_failed", None)
+                c.log.add_event(time.time(), "record_start_failed", None)
+                c.log.write()
             self.notify("Запись началась", f"Созвон «{room}»")
         else:
             self.notify("Созвон начался", f"«{room}» (журнал без записи)")
@@ -243,7 +271,8 @@ class SessionManager:
     async def _enter_grace(self, c: ActiveCall, reason: str, now: float) -> None:
         c.state = "grace"
         c.left_ts = now
-        self.storage.add_event(c.call_id, now, "conference_left", {"reason": reason})
+        c.log.add_event(now, "conference_left", {"reason": reason})
+        c.log.write()
         log.info("Выход из созвона «%s» (%s) — grace %.0f с", c.room, reason,
                  self.cfg.grace_seconds)
         self._refresh_tray()
@@ -291,13 +320,13 @@ class SessionManager:
         """Запускает рекордеры (вызывается в отдельном потоке)."""
         assert c.call_dir is not None
         c.seglog = SegmentLog(c.call_dir / "segments.json")
-        c.rec_mic = AudioRecorder(c.call_dir, "mic", c.seglog, self._thread_event(c.call_id))
-        c.rec_spk = AudioRecorder(c.call_dir, "speakers", c.seglog, self._thread_event(c.call_id))
+        c.rec_mic = AudioRecorder(c.call_dir, "mic", c.seglog, self._thread_event(c))
+        c.rec_spk = AudioRecorder(c.call_dir, "speakers", c.seglog, self._thread_event(c))
         c.rec_mic.start()
         c.rec_spk.start()
         if self.cfg.video_enabled:
             c.rec_video = VideoRecorder(c.call_dir, self.cfg, c.seglog,
-                                        self._thread_event(c.call_id))
+                                        self._thread_event(c))
             c.rec_video.start(self._needles(c))
 
     def _needles(self, c: ActiveCall) -> list[str]:
@@ -309,16 +338,19 @@ class SessionManager:
             out.append(c.room)
         return out or [c.room or "Jitsi Meet"]
 
-    def _thread_event(self, call_id: int):
+    def _thread_event(self, c: ActiveCall):
         """Колбэк для рекордеров (из их потоков): событие в журнал через loop."""
         loop = self._loop
+
+        def persist(etype: str, payload: dict | None) -> None:
+            c.log.add_event(time.time(), etype, payload)
+            c.log.write()
 
         def cb(etype: str, payload: dict | None) -> None:
             if loop is None or loop.is_closed():
                 return
             try:
-                loop.call_soon_threadsafe(self.storage.add_event, call_id,
-                                          time.time(), etype, payload)
+                loop.call_soon_threadsafe(persist, etype, payload)
             except RuntimeError:
                 pass  # loop уже закрыт
 
@@ -336,31 +368,39 @@ class SessionManager:
     # ------------------------------------------------------------- детали
 
     def _update_call_details(self, c: ActiveCall, snap: dict, now: float) -> None:
+        changed = False
         if snap["title"] and snap["title"] != c.title:
             c.title = snap["title"]
             if c.rec_video:
                 c.rec_video.update_needles(self._needles(c))
-        self._diff_participants(c.call_id, c.participants, snap.get("participants"), now)
+        changed |= self._diff_participants(
+            c.log, c.participants, snap.get("participants"), now)
         muted = snap.get("audioMuted")
         if muted is not None and muted != c.audio_muted:
             first_known = c.audio_muted is None
             c.audio_muted = muted
+            changed = True
             if muted:
                 c.mute_open_ts = now
-                self.storage.add_event(c.call_id, now, "mic_muted", None)
+                c.log.add_event(now, "mic_muted", None)
             elif not first_known:  # переход из «неизвестно» в False — не событие
                 if c.mute_open_ts is not None:
                     c.mute_intervals.append((c.mute_open_ts, now))
                     c.mute_open_ts = None
-                self.storage.add_event(c.call_id, now, "mic_unmuted", None)
+                c.log.add_event(now, "mic_unmuted", None)
+        if changed:
+            c.log.write()
 
     def _update_log_only(self, lo: LogOnlyCall, snap: dict, now: float) -> None:
-        self._diff_participants(lo.call_id, lo.participants, snap.get("participants"), now)
+        if self._diff_participants(
+                lo.log, lo.participants, snap.get("participants"), now):
+            lo.log.write()
 
-    def _diff_participants(self, call_id: int, current: dict[str, dict],
-                           new_list, now: float) -> None:
+    def _diff_participants(self, clog: CallLog, current: dict[str, dict],
+                           new_list, now: float) -> bool:
         if not isinstance(new_list, list):
-            return
+            return False
+        changed = False
         new = {}
         for p in new_list:
             if isinstance(p, dict) and p.get("id"):
@@ -370,26 +410,29 @@ class SessionManager:
         for pid, info in new.items():
             old = current.get(pid)
             if old is None:
-                self.storage.participant_joined(call_id, pid, info["name"],
-                                                info["local"], now)
-                self.storage.add_event(call_id, now, "participant_joined",
-                                       {"id": pid, "name": info["name"],
-                                        "local": info["local"]})
+                changed |= clog.participant_joined(
+                    pid, info["name"], info["local"], now)
+                clog.add_event(now, "participant_joined",
+                               {"id": pid, "name": info["name"],
+                                "local": info["local"]})
+                changed = True
             elif info["name"] and old.get("name") != info["name"]:
-                self.storage.participant_joined(call_id, pid, info["name"],
-                                                info["local"], now)  # обновит имя
+                changed |= clog.participant_joined(
+                    pid, info["name"], info["local"], now)
         for pid in list(current.keys() - new.keys()):
             name = current[pid].get("name", "")
-            self.storage.participant_left(call_id, pid, now)
-            self.storage.add_event(call_id, now, "participant_left",
-                                   {"id": pid, "name": name})
+            changed |= clog.participant_left(pid, now)
+            clog.add_event(now, "participant_left", {"id": pid, "name": name})
+            changed = True
         current.clear()
         current.update(new)
+        return changed
 
     def _close_log_only(self, lo: LogOnlyCall, now: float, reason: str) -> None:
-        self.storage.close_open_participants(lo.call_id, now)
-        self.storage.finish_call(lo.call_id, now, lo.started_ts, reason)
-        self.storage.set_call_status(lo.call_id, "done")
+        lo.log.close_open_participants(now)
+        lo.log.finish(now, lo.started_ts, reason)
+        lo.log.set_status("done")
+        lo.log.write()
 
     # ------------------------------------------------------------- финализация
 
@@ -437,15 +480,15 @@ class SessionManager:
         if c.mute_open_ts is not None:
             c.mute_intervals.append((c.mute_open_ts, end_ts))
             c.mute_open_ts = None
-        self.storage.close_open_participants(c.call_id, end_ts)
-        self.storage.finish_call(c.call_id, end_ts, c.started_ts, reason)
+        c.log.close_open_participants(end_ts)
+        c.log.finish(end_ts, c.started_ts, reason)
         dur = int(end_ts - c.started_ts)
         log.info("Созвон «%s» завершён (%s), длительность %d:%02d",
                  c.room, reason, dur // 60, dur % 60)
         self.set_tray("finalizing", f"«{c.room}»: сборка записи…")
 
         if c.recorded and c.call_dir is not None:
-            self.storage.set_call_status(c.call_id, "finalizing")
+            c.log.set_status("finalizing")
             await asyncio.to_thread(self._stop_media, c)
             finalized = False
             try:
@@ -453,21 +496,20 @@ class SessionManager:
                 result = await mux.finalize_call(self.cfg, c.call_dir,
                                                  SegmentLog.load(c.call_dir / "segments.json"),
                                                  mute)
-                self.storage.set_call_files(c.call_id, **result)
-                self.storage.set_call_status(c.call_id, "done")
+                c.log.set_files(**result)
+                c.log.set_status("done")
                 finalized = True
                 self.notify("Запись сохранена",
                             f"«{c.room}» · {dur // 60} мин {dur % 60} с")
             except Exception as e:
-                log.exception("Ошибка финализации записи #%d", c.call_id)
-                self.storage.set_call_status(c.call_id, "error", error=str(e))
+                log.exception("Ошибка финализации записи «%s»", c.room)
+                c.log.set_status("error", error=str(e))
                 self.notify("Ошибка сборки записи", f"«{c.room}»: {e}")
         else:
-            self.storage.set_call_status(c.call_id, "done")
+            c.log.set_status("done")
             self.notify("Созвон завершён", f"«{c.room}» · {dur // 60} мин {dur % 60} с")
 
-        if c.call_dir is not None:
-            self._write_meta(c.call_id, c.call_dir)
+        c.log.write()
         self._refresh_tray()
         # Долгую сетевую постобработку не держим внутри задачи медиасборки:
         # при выходе ждём только безопасного закрытия и сборки локальных файлов.
@@ -481,33 +523,15 @@ class SessionManager:
             if self.call is None:
                 self.set_tray("transcribing",
                               f"«{c.room}»: распознавание речи…")
-            text = await transcribe.transcribe_call(
-                self.cfg, self.storage, c.call_id, c.call_dir,
-                c.room, self.notify)
+            text = await transcribe.transcribe_call(self.cfg, c.log, self.notify)
             if text:
                 await summarize.maybe_summarize(
-                    self.cfg, self.storage, c.call_id, c.call_dir, c.room,
-                    self.notify,
+                    self.cfg, c.log, self.notify,
                     set_tray=self.set_tray if self.call is None else None,
                     transcript=text)
         finally:
-            self._write_meta(c.call_id, c.call_dir)
+            c.log.write()
             self._refresh_tray()
-
-    def _write_meta(self, call_id: int, call_dir: Path) -> None:
-        try:
-            row = self.storage.get_call(call_id)
-            if row is None:
-                return
-            meta = {
-                "call": dict(row),
-                "participants": [dict(r) for r in self.storage.call_participants(call_id)],
-                "events": [dict(r) for r in self.storage.call_events(call_id)],
-            }
-            (call_dir / "meta.json").write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            log.exception("Не удалось записать meta.json для #%d", call_id)
 
     # ------------------------------------------------------------- сервис
 

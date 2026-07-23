@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import logging
 import msvcrt
+import os
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -49,13 +51,19 @@ def pick_audio(cfg, call_dir: Path) -> Path:
 # --- Очередь ручных задач (кнопки вкладки «Список записей») -----------------
 # Окно настроек — отдельный процесс; задачи передаются через файл в APPDATA,
 # основное приложение подхватывает их в watchdog (и при старте).
-# Действия: "stt" — распознать (резюме по настройке), "summary" — резюме по
-# готовому транскрипту, "stt_summary" — распознать и сделать резюме.
+# Задача — папка записи (dir) + действие: "stt" — распознать (резюме по
+# настройке), "summary" — резюме по готовому транскрипту, "stt_summary" —
+# распознать и сделать резюме.
 
 def queue_path() -> Path:
     from app.config import appdata_dir
 
     return appdata_dir() / "transcribe_queue.json"
+
+
+def legacy_queue_path() -> Path:
+    """Файл задач старого формата, которые не удалось сопоставить с папками."""
+    return queue_path().with_name("transcribe_queue_legacy.json")
 
 
 @contextmanager
@@ -78,18 +86,13 @@ def _queue_lock():
 
 
 def _normalize_task(item) -> dict | None:
-    if isinstance(item, dict) and "call_id" in item:
-        return {"call_id": int(item["call_id"]),
+    if isinstance(item, dict) and item.get("dir"):
+        return {"dir": str(item["dir"]),
                 "action": str(item.get("action", "stt"))}
-    if isinstance(item, (int, float, str)):
-        try:
-            return {"call_id": int(item), "action": "stt"}
-        except (TypeError, ValueError):
-            return None
     return None
 
 
-def _read_queue() -> list[dict]:
+def _read_queue_raw() -> list:
     qp = queue_path()
     if not qp.exists():
         return []
@@ -97,8 +100,12 @@ def _read_queue() -> list[dict]:
         raw = json.loads(qp.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return []
+    return raw if isinstance(raw, list) else []
+
+
+def _read_queue() -> list[dict]:
     out = []
-    for item in raw if isinstance(raw, list) else []:
+    for item in _read_queue_raw():
         task = _normalize_task(item)
         if task is not None:
             out.append(task)
@@ -111,14 +118,117 @@ def _write_queue(tasks: list[dict]) -> None:
         qp.unlink(missing_ok=True)
         return
     tmp = qp.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(tasks), encoding="utf-8")
-    tmp.replace(qp)
+    try:
+        tmp.write_text(json.dumps(tasks, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, qp)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-def enqueue(call_id: int, action: str = "stt") -> None:
+def _archive_legacy_tasks(tasks: list) -> None:
+    if not tasks:
+        return
+    path = legacy_queue_path()
+    existing = []
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                existing = raw
+        except (OSError, json.JSONDecodeError):
+            pass
+    for task in tasks:
+        if task not in existing:
+            existing.append(task)
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def migrate_legacy_queue(db_paths: Path | tuple[Path, ...]) -> tuple[int, int]:
+    """Переводит сохранённые задачи `call_id` в новый формат с путём.
+
+    Несопоставленные элементы не теряются: они уходят в отдельный архив,
+    поэтому основной watchdog не запускает пустой обработчик бесконечно.
+    """
+    with _queue_lock():
+        raw = _read_queue_raw()
+        if not raw:
+            return 0, 0
+        current: list[dict] = []
+        legacy: list[tuple[object, dict]] = []
+        invalid: list = []
+        for item in raw:
+            normalized = _normalize_task(item)
+            if normalized is not None:
+                if normalized not in current:
+                    current.append(normalized)
+                continue
+            if isinstance(item, dict) and "call_id" in item:
+                try:
+                    call_id = int(item["call_id"])
+                except (TypeError, ValueError):
+                    invalid.append(item)
+                    continue
+                legacy.append((call_id, item))
+            else:
+                invalid.append(item)
+
+        directories: dict[int, str] = {}
+        candidates = (db_paths,) if isinstance(db_paths, Path) else db_paths
+        ids = sorted({int(call_id) for call_id, _ in legacy})
+        for db_path in candidates:
+            missing = [call_id for call_id in ids
+                       if call_id not in directories]
+            if not missing or not db_path.exists():
+                continue
+            try:
+                uri = db_path.resolve().as_uri() + "?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+                try:
+                    placeholders = ",".join("?" for _ in missing)
+                    rows = conn.execute(
+                        f"SELECT id, dir FROM calls WHERE id IN ({placeholders})",
+                        missing).fetchall()
+                    directories.update(
+                        (int(call_id), str(call_dir))
+                        for call_id, call_dir in rows if call_dir)
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                log.exception(
+                    "Не удалось прочитать старую БД для миграции очереди: %s",
+                    db_path)
+
+        migrated = 0
+        unresolved = list(invalid)
+        for call_id, original in legacy:
+            call_dir = directories.get(int(call_id))
+            if not call_dir:
+                unresolved.append(original)
+                continue
+            task = {
+                "dir": call_dir,
+                "action": str(original.get("action", "stt")),
+            }
+            if task not in current:
+                current.append(task)
+            migrated += 1
+
+        _archive_legacy_tasks(unresolved)
+        _write_queue(current)
+        return migrated, len(unresolved)
+
+
+def enqueue(call_dir: str, action: str = "stt") -> None:
     with _queue_lock():
         tasks = _read_queue()
-        task = {"call_id": int(call_id), "action": action}
+        task = {"dir": str(call_dir), "action": action}
         if task not in tasks:
             tasks.append(task)
         _write_queue(tasks)
@@ -215,38 +325,43 @@ def run(cfg, audio: Path) -> str:
     return text
 
 
-async def transcribe_call(cfg, storage, call_id: int, call_dir: Path,
-                          room: str, notify) -> str | None:
-    """Полный цикл для созвона: аудио -> сервер -> transcript.txt + БД/события.
+async def transcribe_call(cfg, call, notify) -> str | None:
+    """Полный цикл для созвона: аудио -> сервер -> transcript.txt + meta.json.
 
-    Возвращает текст транскрипта (для последующего резюме) или None при ошибке.
+    `call` — CallLog записи. Возвращает текст транскрипта (для последующего
+    резюме) или None при ошибке.
     """
+    from app import records
+
+    call_dir = call.call_dir
+    room = call.room
     audio = pick_audio(cfg, call_dir)
-    previous_status = storage.begin_processing(call_id, "transcribing")
-    if previous_status is None:
-        log.info("STT для записи #%d не запущен: запись удалена или занята",
-                 call_id)
+    if not records.try_acquire(call_dir):
+        log.info("STT для «%s» не запущен: запись уже обрабатывается", room)
         return None
+    previous_status = call.status
+    call.set_status("transcribing")
+    call.write()
     try:
-        storage.add_event(call_id, time.time(), "transcribe_started",
-                          {"file": audio.name})
+        call.add_event(time.time(), "transcribe_started", {"file": audio.name})
+        call.write()
         try:
             text = await workers.run_daemon(run, cfg, audio)
             tpath = call_dir / "transcript.txt"
             tpath.write_text(text, encoding="utf-8")
-            storage.set_call_files(call_id, transcript_path=str(tpath))
-            storage.add_event(call_id, time.time(), "transcribe_done",
-                              {"chars": len(text)})
+            call.set_files(transcript_path=str(tpath))
+            call.add_event(time.time(), "transcribe_done", {"chars": len(text)})
             notify("Транскрипция готова", f"«{room}» → transcript.txt")
             return text
         except Exception as e:
-            log.exception("Ошибка транскрипции созвона #%d", call_id)
-            storage.add_event(call_id, time.time(), "transcribe_failed",
-                              {"error": str(e)})
+            log.exception("Ошибка транскрипции созвона «%s»", room)
+            call.add_event(time.time(), "transcribe_failed", {"error": str(e)})
             notify("Ошибка транскрипции", f"«{room}»: {e}")
             return None
     finally:
-        storage.finish_processing(call_id, "transcribing", previous_status)
+        call.set_status(previous_status)
+        call.write()
+        records.release(call_dir)
 
 
 def main() -> None:

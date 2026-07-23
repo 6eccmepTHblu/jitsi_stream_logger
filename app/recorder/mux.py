@@ -137,7 +137,7 @@ async def _build_audio_track(cfg: Config, call_dir: Path, segs: list[dict],
 
 async def finalize_call(cfg: Config, call_dir: Path, segdata: dict,
                         mute_intervals: list) -> dict:
-    """Собирает итоговые файлы; возвращает поля путей для БД."""
+    """Собирает итоговые файлы; возвращает поля путей для журнала записи."""
     audio_segs = segdata.get("audio", [])
     video_segs = [v for v in segdata.get("video", [])
                   if (call_dir / v["path"]).exists()

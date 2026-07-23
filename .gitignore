@@ -21,12 +21,9 @@ Thumbs.db
 /dist/
 *.spec
 
-# Локальные настройки, журналы и БД
+# Локальные настройки и журналы
 /config.toml
 *.log
-*.db
-*.db-wal
-*.db-shm
 summary_prompt.txt
 transcribe_queue.json
 transcribe_queue.lock
