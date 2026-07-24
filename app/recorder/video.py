@@ -78,12 +78,15 @@ def list_windows(needles: list[str], process_name: str | None) -> list[tuple[int
 
 class VideoRecorder:
     def __init__(self, out_dir: Path, cfg: Config, seglog: SegmentLog, event_cb=None,
-                 process_name: str = "chrome.exe"):
+                 process_name: str = "chrome.exe", mode: str | None = None):
         self.out_dir = out_dir
         self.cfg = cfg
         self.seglog = seglog
         self.event_cb = event_cb or (lambda etype, payload: None)
         self.process_name = process_name
+        # mode=None — брать режим из конфига (и подхватывать его правки на лету);
+        # заданный режим перекрывает конфиг на весь срок жизни рекордера.
+        self._mode_override = mode
         self._needles: list[str] = []
         self._needles_lock = threading.Lock()
         self._stop = threading.Event()
@@ -96,6 +99,10 @@ class VideoRecorder:
         self._fflog = open(self.out_dir / "ffmpeg_video.log", "ab")
         self._thread = threading.Thread(target=self._run, daemon=True, name="video")
         self._thread.start()
+
+    @property
+    def mode(self) -> str:
+        return self._mode_override or self.cfg.video_mode
 
     def update_needles(self, needles: list[str]) -> None:
         with self._needles_lock:
@@ -120,10 +127,10 @@ class VideoRecorder:
         return results[0] if results else None
 
     def _run(self) -> None:
-        if self.cfg.video_mode in ("monitor", "cursor"):
+        if self.mode in ("monitor", "cursor"):
             # Режимы «монитор целиком» и «экран, где курсор» — окно не ищем.
             while not self._stop.is_set():
-                idx = (monitor_at_cursor() if self.cfg.video_mode == "cursor"
+                idx = (monitor_at_cursor() if self.mode == "cursor"
                        else self.cfg.video_monitor)
                 log.info("Захват монитора %d", idx)
                 try:
@@ -245,7 +252,7 @@ class VideoRecorder:
                         break
                 # В режиме «экран, где курсор» переключаемся вслед за курсором
                 # (два подряд попадания на другой монитор ≈ 1 с стабильности).
-                elif (hwnd is None and self.cfg.video_mode == "cursor"
+                elif (hwnd is None and self.mode == "cursor"
                         and monitor_index is not None and now - last_guard >= 0.5):
                     last_guard = now
                     cur = monitor_at_cursor()

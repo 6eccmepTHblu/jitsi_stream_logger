@@ -47,6 +47,8 @@ class Tray:
         menu = pystray.Menu(
             pystray.MenuItem(lambda item: self._status, None, enabled=False),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: self.app.record_action_text,
+                             lambda icon, item: self.app.toggle_manual_record()),
             pystray.MenuItem("Настройки…",
                              lambda icon, item: self.app.open_settings(),
                              default=True),  # двойной клик по иконке

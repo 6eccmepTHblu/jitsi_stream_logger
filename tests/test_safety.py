@@ -283,16 +283,11 @@ class ProcessingLockTests(unittest.TestCase):
 
 
 class QueueSafetyTests(unittest.TestCase):
-    def test_audio_format_setting_is_respected(self) -> None:
+    def test_stt_audio_is_mix_ogg(self) -> None:
         call_dir = Path("call")
         self.assertEqual(
-            transcribe.pick_audio(
-                SimpleNamespace(tr_upload="ogg"), call_dir).name,
+            transcribe.pick_audio(SimpleNamespace(), call_dir).name,
             "mix.ogg")
-        self.assertEqual(
-            transcribe.pick_audio(
-                SimpleNamespace(tr_upload="wav"), call_dir).name,
-            "mix_16k_mono.wav")
 
     def test_ack_preserves_tasks_added_after_peek(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -366,8 +361,10 @@ class ShutdownSafetyTests(unittest.IsolatedAsyncioTestCase):
 class ExtensionOriginTests(unittest.TestCase):
     def test_manifest_key_matches_server_extension_id(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        manifest = json.loads(
-            (root / "extension" / "manifest.json").read_text(encoding="utf-8"))
+        # Проверяем шаблон: рабочий manifest.json генерируется локально
+        # (tools/make_manifest.py) и в репозиторий не попадает.
+        manifest = json.loads((root / "extension" / "manifest.template.json")
+                              .read_text(encoding="utf-8"))
         public_key = base64.b64decode(manifest["key"])
         digest = hashlib.sha256(public_key).digest()[:16]
         extension_id = "".join(
@@ -404,10 +401,26 @@ class ExtensionOriginTests(unittest.TestCase):
         text = "\n".join(
             (root / relative).read_text(encoding="utf-8")
             for relative in (
-                "README.md", "app/config.py", "extension/manifest.json"))
+                "README.md", "app/config.py",
+                "extension/manifest.template.json"))
         for marker in ("s" + "gaz", "test-" + "dell", "vks" + "03",
                        "cyan" + "kiwi"):
             self.assertNotIn(marker, text.lower())
+
+    def test_manifest_is_generated_and_not_tracked(self) -> None:
+        """Домены живут только в config.toml: шаблон хранит плейсхолдер,
+        а сгенерированный manifest.json заигнорен. Иначе `git checkout`
+        молча стирает рабочий домен и запись перестаёт запускаться."""
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "extension" / "manifest.template.json").read_text(
+            encoding="utf-8")
+        self.assertIn("__DOMAIN_MATCHES__", template)
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "extension/manifest.json"],
+            cwd=root, capture_output=True, text=True)
+        self.assertNotEqual(
+            tracked.returncode, 0,
+            "extension/manifest.json не должен быть под контролем версий")
 
 
 if __name__ == "__main__":

@@ -42,9 +42,7 @@ def request_stop() -> None:
 
 
 def pick_audio(cfg, call_dir: Path) -> Path:
-    """Выбирает общий микс в формате, заданном настройкой upload."""
-    if str(cfg.tr_upload).lower() == "wav":
-        return call_dir / "mix_16k_mono.wav"
+    """Общий голосовой микс для отправки на сервер распознавания речи."""
     return call_dir / "mix.ogg"
 
 
@@ -349,7 +347,6 @@ async def transcribe_call(cfg, call, notify) -> str | None:
             text = await workers.run_daemon(run, cfg, audio)
             tpath = call_dir / "transcript.txt"
             tpath.write_text(text, encoding="utf-8")
-            call.set_files(transcript_path=str(tpath))
             call.add_event(time.time(), "transcribe_done", {"chars": len(text)})
             notify("Транскрипция готова", f"«{room}» → transcript.txt")
             return text

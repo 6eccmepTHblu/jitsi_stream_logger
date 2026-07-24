@@ -13,15 +13,19 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $py = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { throw "Не найден $py — сначала создайте venv (см. README)" }
 
-Write-Host "[1/4] Устанавливаю PyInstaller..."
+Write-Host "[1/5] Устанавливаю PyInstaller..."
 & $py -m pip install --quiet --disable-pip-version-check pyinstaller
 
-Write-Host "[2/4] Генерирую иконку..."
+Write-Host "[2/5] Генерирую манифест расширения (домены из config.toml)..."
+& $py (Join-Path $root "tools\make_manifest.py")
+if ($LASTEXITCODE -ne 0) { throw "Не удалось сгенерировать extension\manifest.json" }
+
+Write-Host "[3/5] Генерирую иконку..."
 New-Item -ItemType Directory -Force (Join-Path $root "assets") | Out-Null
 Push-Location $root
 & $py -c "from PIL import Image; from app.tray import _icon_image; _icon_image(False).resize((256,256), Image.LANCZOS).save(r'assets\icon.ico', sizes=[(16,16),(32,32),(48,48),(256,256)])"
 
-Write-Host "[3/4] Собираю exe (PyInstaller)..."
+Write-Host "[4/5] Собираю exe (PyInstaller)..."
 & $py -m PyInstaller --noconfirm --clean --onedir --noconsole `
     --name JitsiStreamLogger `
     --icon "$root\assets\icon.ico" `
@@ -32,7 +36,7 @@ $code = $LASTEXITCODE
 Pop-Location
 if ($code -ne 0) { throw "PyInstaller завершился с ошибкой ($code)" }
 
-Write-Host "[4/4] Складываю комплект рядом с exe..."
+Write-Host "[5/5] Складываю комплект рядом с exe..."
 $dist = Join-Path $root "dist\JitsiStreamLogger"
 Copy-Item -Recurse -Force (Join-Path $root "extension") (Join-Path $dist "extension")
 Set-Content -Encoding ascii (Join-Path $dist "Включить автозапуск.bat") "@echo off`r`nstart `"`" `"%~dp0JitsiStreamLogger.exe`" --install-autostart"

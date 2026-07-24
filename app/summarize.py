@@ -154,7 +154,6 @@ async def maybe_summarize(cfg, call, notify, set_tray=None,
             text = await workers.run_daemon(run, cfg, transcript, room, started)
             spath = call_dir / "summary.txt"
             spath.write_text(text, encoding="utf-8")
-            call.set_files(summary_path=str(spath))
             call.add_event(time.time(), "summary_done", {"chars": len(text)})
             notify("Резюме готово", f"«{room}» → summary.txt")
         except Exception as e:

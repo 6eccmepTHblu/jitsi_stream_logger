@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from app import autostart, records, summarize, transcribe
 from app.config import APP_TITLE, appdata_dir, load_config, set_config_value
+from app.recorder.encode import VIDEO_QUALITY_KEYS, VIDEO_QUALITY_PRESETS
 
 DELETABLE_STATUSES = records.DELETABLE_STATUSES
 
@@ -73,11 +74,9 @@ def _build_settings_tab(frm: ttk.Frame, cfg):
     ttk.Radiobutton(lf_v, text="Видео отключено (только звук и журнал)",
                     variable=var_mode, value="off").grid(
         row=3, column=0, columnspan=3, sticky="w")
-    var_av1 = tk.BooleanVar(value=(cfg.video_encoder == "libsvtav1"))
-    ttk.Checkbutton(
-        lf_v, text="Сжимать в AV1 (меньше размер, выше нагрузка на CPU)",
-        variable=var_av1).grid(row=4, column=0, columnspan=3, sticky="w",
-                               pady=(4, 0))
+    ttk.Label(lf_v, text="Кодек и качество — на вкладке «Качество видео».",
+              foreground="#777").grid(row=4, column=0, columnspan=3, sticky="w",
+                                      pady=(4, 0))
 
     lf_a = ttk.LabelFrame(frm, text="Звук (обработка при сборке)", padding=8)
     lf_a.grid(row=2, column=0, sticky="we", pady=(0, 8))
@@ -140,12 +139,6 @@ def _build_settings_tab(frm: ttk.Frame, cfg):
         if mode != "off":
             set_config_value("video", "mode", mode)
         set_config_value("video", "monitor_index", int(var_mon.get()))
-        # Кодек трогаем только если галку AV1 переключили — чтобы не затирать
-        # вручную выставленный аппаратный кодер.
-        want_av1 = bool(var_av1.get())
-        if want_av1 != (cfg.video_encoder == "libsvtav1"):
-            set_config_value("video", "encoder",
-                             "libsvtav1" if want_av1 else "libx264")
         set_config_value("audio", "mic_denoise", bool(var_denoise.get()))
         set_config_value("audio", "echo_duck", bool(var_duck.get()))
         set_config_value("audio", "respect_mic_mute", bool(var_mute.get()))
@@ -164,6 +157,45 @@ def _build_settings_tab(frm: ttk.Frame, cfg):
             messagebox.showwarning(
                 APP_TITLE,
                 f"Настройки сохранены, но автозапуск не изменён:\n{e}")
+        return True
+
+    return collect
+
+
+# --------------------------------------------------------- вкладка «качество»
+
+def _build_quality_tab(frm: ttk.Frame, cfg):
+    """Радио-выбор пресета кодека; применяется к итоговому видео (call.mp4)."""
+    # Текущий пресет: из config, иначе выводим из ранее выбранного кодека
+    # (совместимость со старыми config.toml, где был только encoder).
+    current = getattr(cfg, "video_quality_preset", "") or ""
+    if current not in VIDEO_QUALITY_KEYS:
+        current = "av1_crf50" if cfg.video_encoder == "libsvtav1" else "h264_crf28"
+    var_q = tk.StringVar(value=current)
+
+    ttk.Label(
+        frm,
+        text="Кодек и параметры сжатия итогового видео созвона (call.mp4).",
+    ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+    lf = ttk.LabelFrame(frm, text="Кодек и параметры", padding=8)
+    lf.grid(row=1, column=0, sticky="we")
+    for i, p in enumerate(VIDEO_QUALITY_PRESETS):
+        ttk.Radiobutton(lf, text=p["label"], value=p["key"],
+                        variable=var_q).grid(row=i * 2, column=0, sticky="w",
+                                             pady=(6 if i else 0, 0))
+        ttk.Label(lf, text=p["hint"], foreground="#777").grid(
+            row=i * 2 + 1, column=0, sticky="w", padx=(24, 0))
+
+    ttk.Label(
+        frm, foreground="#777", justify="left",
+        text=("CRF больше — меньше размер и ниже качество. H.265, AV1 и VP9\n"
+              "дают меньший файл, чем H.264, но сильнее нагружают процессор\n"
+              "и хуже совместимы со старыми плеерами."),
+    ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+    def collect() -> bool:
+        set_config_value("video", "quality_preset", var_q.get())
         return True
 
     return collect
@@ -446,14 +478,17 @@ def run_settings() -> None:
 
     nb = ttk.Notebook(root)
     tab_settings = ttk.Frame(nb, padding=12)
+    tab_quality = ttk.Frame(nb, padding=12)
     tab_summary = ttk.Frame(nb, padding=12)
     tab_records = ttk.Frame(nb, padding=12)
     nb.add(tab_settings, text="Настройки")
+    nb.add(tab_quality, text="Качество видео")
     nb.add(tab_summary, text="Резюме")
     nb.add(tab_records, text="Список записей")
     nb.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
     collect_settings = _build_settings_tab(tab_settings, cfg)
+    collect_quality = _build_quality_tab(tab_quality, cfg)
     collect_summary = _build_summary_tab(tab_summary, cfg)
     _build_records_tab(tab_records, cfg)
 
@@ -461,7 +496,7 @@ def run_settings() -> None:
     btns.grid(row=1, column=0, sticky="e")
 
     def save() -> None:
-        if collect_settings() and collect_summary():
+        if collect_settings() and collect_quality() and collect_summary():
             root.destroy()
 
     ttk.Button(btns, text="Сохранить", command=save).grid(

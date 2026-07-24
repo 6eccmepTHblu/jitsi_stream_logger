@@ -23,6 +23,8 @@ Thumbs.db
 
 # Локальные настройки и журналы
 /config.toml
+# Генерируется из manifest.template.json: python tools/make_manifest.py
+/extension/manifest.json
 *.log
 summary_prompt.txt
 transcribe_queue.json

@@ -59,6 +59,26 @@ class App:
         if self.loop and self.sm:
             self.loop.call_soon_threadsafe(self.sm.set_paused, not self.sm.paused)
 
+    @property
+    def record_action_text(self) -> str:
+        """Подпись кнопки записи в трее (читается из потока трея)."""
+        sm = self.sm
+        call = sm.call if sm is not None else None
+        if call is None:
+            return "Начать запись вручную"
+        if call.manual:
+            return "Остановить ручную запись"
+        return "Остановить запись созвона"
+
+    def toggle_manual_record(self) -> None:
+        """Ручной старт/стоп записи из трея: coroutine — только через loop."""
+        if self.loop is None or self.sm is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.sm.toggle_manual(), self.loop)
+        except RuntimeError:
+            log.warning("Ручная запись: фоновый цикл уже остановлен")
+
     def open_records(self) -> None:
         os.startfile(self.cfg.records_dir)  # noqa: S606
 
@@ -226,9 +246,9 @@ class App:
         for f in ("records_dir", "allowed_domains", "auto_record", "ffmpeg_path",
                   "video_enabled", "video_mode", "video_monitor", "video_fps",
                   "video_crf", "video_preset", "video_encoder",
-                  "av1_preset", "av1_crf",
+                  "video_quality_preset", "av1_preset", "av1_crf",
                   "respect_mic_mute", "mic_denoise", "echo_duck",
-                  "tr_enabled", "tr_url", "tr_upload", "tr_poll_s",
+                  "tr_enabled", "tr_url", "tr_poll_s",
                   "tr_timeout_min", "sum_enabled", "sum_url", "sum_model",
                   "sum_temperature", "sum_timeout_min",
                   "keep_raw", "delete_stems", "delete_mux_log",
@@ -376,7 +396,6 @@ class App:
         mute = self._mute_intervals_from_events(call, end_ts)
         result = await mux.finalize_call(self.cfg, call_dir, seg,
                                          mute if self.cfg.respect_mic_mute else [])
-        call.set_files(**result)
         call.set_status("done")
         call.add_event(time.time(), "recovered_after_crash", None)
         call.write()

@@ -44,8 +44,20 @@ monitor_index = 1
 fps = 15
 crf = 26
 preset = "veryfast"
+# Пресет качества (вкладка «Качество видео» в настройках). Если задан —
+# полностью определяет кодек и параметры итогового видео, переопределяя
+# encoder/crf/preset ниже. Возможные значения:
+#   h264_crf28  — H.264 (libx264, preset medium, CRF 28), макс. совместимость
+#   h265_crf30  — H.265/HEVC (libx265, preset medium, CRF 30)
+#   h265_crf35  — H.265/HEVC (libx265, preset medium, CRF 35), меньше файл
+#   av1_crf50   — AV1 (libsvtav1, preset 8, CRF 50)
+#   av1_crf55   — AV1 (libsvtav1, preset 8, CRF 55), минимальный размер
+#   vp9_crf40   — VP9 (libvpx-vp9, CRF 40, b:v 0)
+# Пусто ("") — использовать encoder/crf/preset ниже (совместимость).
+quality_preset = "h264_crf28"
 # libx264 | libsvtav1 (AV1, меньше размер) | h264_nvenc | h264_qsv | h264_amf
 # Аппаратный AV1 (av1_nvenc) требует NVIDIA RTX 40+; на старых картах — libsvtav1.
+# Действует только при пустом quality_preset.
 encoder = "libx264"
 # Параметры AV1 (действуют при encoder = "libsvtav1"):
 # preset 0(медленно/меньше файл)…13(быстро/больше), crf 0…63 (больше = меньше/хуже).
@@ -66,8 +78,6 @@ echo_duck = true
 # Отправлять готовую запись на сервер распознавания речи (STT) после созвона.
 enabled = false
 url = "http://127.0.0.1:8090"
-# Что отправлять: "ogg" (mix.ogg, компактно) или "wav" (mix_16k_mono.wav).
-upload = "ogg"
 # Период опроса результата (сек) и общий таймаут ожидания (мин).
 poll_interval_s = 10
 timeout_min = 180
@@ -111,6 +121,7 @@ class Config:
     video_crf: int
     video_preset: str
     video_encoder: str
+    video_quality_preset: str
     av1_preset: int
     av1_crf: int
     respect_mic_mute: bool
@@ -118,7 +129,6 @@ class Config:
     echo_duck: bool
     tr_enabled: bool
     tr_url: str
-    tr_upload: str          # "ogg" | "wav"
     tr_poll_s: int
     tr_timeout_min: int
     sum_enabled: bool
@@ -176,6 +186,7 @@ def load_config() -> Config:
         video_crf=int(video.get("crf", 26)),
         video_preset=str(video.get("preset", "veryfast")),
         video_encoder=str(video.get("encoder", "libx264")),
+        video_quality_preset=str(video.get("quality_preset", "")),
         av1_preset=int(video.get("av1_preset", 7)),
         av1_crf=int(video.get("av1_crf", 38)),
         respect_mic_mute=bool(audio.get("respect_mic_mute", True)),
@@ -183,7 +194,6 @@ def load_config() -> Config:
         echo_duck=bool(audio.get("echo_duck", True)),
         tr_enabled=bool(tr.get("enabled", False)),
         tr_url=str(tr.get("url", "http://127.0.0.1:8090")).rstrip("/"),
-        tr_upload=str(tr.get("upload", "ogg")),
         tr_poll_s=int(tr.get("poll_interval_s", 10)),
         tr_timeout_min=int(tr.get("timeout_min", 180)),
         sum_enabled=bool(summ.get("enabled", False)),

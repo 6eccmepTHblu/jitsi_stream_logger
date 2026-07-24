@@ -33,10 +33,6 @@ DELETABLE_STATUSES = frozenset({"done", "log_only", "error"})
 KNOWN_STATUSES = frozenset(
     {*ACTIVE_STATUSES, *PROCESSING_STATUSES, *DELETABLE_STATUSES})
 
-# Ключи путей к готовым файлам записи (были столбцами таблицы calls).
-FILE_KEYS = ("video_path", "media_path", "mic_path", "speakers_path",
-             "asr_wav_path", "transcript_path", "summary_path")
-
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -86,11 +82,12 @@ def is_owned_meta(meta: object) -> bool:
     )
 
 
-def _is_legacy_meta(meta: object, call_dir: Path) -> bool:
-    """Строго распознаёт старый журнал без маркера формата.
+def _is_legacy_meta(meta: object) -> bool:
+    """Строго распознаёт старый журнал без маркера формата — по форме секций.
 
-    Совпадение пути обязательно: так чужой meta.json с похожими полями не
-    превращается в принадлежащую приложению запись.
+    Пути к файлам и папке (dir) в meta.json больше не хранятся и не проверяются;
+    от чужого meta.json защищают обязательный набор полей секции call, известный
+    статус и наличие списков participants/events.
     """
     if not isinstance(meta, dict):
         return False
@@ -105,19 +102,11 @@ def _is_legacy_meta(meta: object, call_dir: Path) -> bool:
         return False
     required = {
         "room", "url", "tab_id", "started_at", "ended_at", "duration_sec",
-        "end_reason", "status", "recorded", "dir", "error", *FILE_KEYS,
+        "end_reason", "status", "recorded", "error",
     }
     if not required.issubset(call):
         return False
     if str(call.get("status") or "") not in KNOWN_STATUSES:
-        return False
-    raw_dir = call.get("dir")
-    if not isinstance(raw_dir, str) or not raw_dir:
-        return False
-    try:
-        if Path(raw_dir).resolve() != call_dir.resolve():
-            return False
-    except OSError:
         return False
     return True
 
@@ -157,7 +146,6 @@ class CallLog:
     duration_sec: float | None = None
     end_reason: str | None = None
     error: str | None = None
-    files: dict[str, str | None] = field(default_factory=dict)
     participants: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
 
@@ -180,11 +168,6 @@ class CallLog:
         self.ended_at = ts_iso(ended_ts)
         self.duration_sec = round(max(0.0, ended_ts - started_ts), 1)
         self.end_reason = reason
-
-    def set_files(self, **paths: str | None) -> None:
-        for key, value in paths.items():
-            if key in FILE_KEYS:
-                self.files[key] = value
 
     # --- события ---
 
@@ -223,7 +206,7 @@ class CallLog:
     # --- сериализация ---
 
     def call_dict(self) -> dict:
-        d = {
+        return {
             "room": self.room,
             "url": self.url,
             "tab_id": self.tab_id,
@@ -233,12 +216,8 @@ class CallLog:
             "end_reason": self.end_reason,
             "status": self.status,
             "recorded": int(self.recorded),
-            "dir": str(self.call_dir) if self.call_dir else None,
             "error": self.error,
         }
-        for key in FILE_KEYS:
-            d[key] = self.files.get(key)
-        return d
 
     def to_meta(self) -> dict:
         return {
@@ -278,7 +257,6 @@ class CallLog:
             duration_sec=call.get("duration_sec"),
             end_reason=call.get("end_reason"),
             error=call.get("error"),
-            files={k: call.get(k) for k in FILE_KEYS if call.get(k)},
             participants=list(meta.get("participants") or []),
             events=list(meta.get("events") or []),
         )
@@ -303,7 +281,7 @@ def read_meta(call_dir: Path, *, migrate_legacy: bool = False) -> dict | None:
         return None
     if _valid_owned_meta(meta):
         return meta
-    if not _is_legacy_meta(meta, call_dir):
+    if not _is_legacy_meta(meta):
         return None
     if migrate_legacy:
         migrated = dict(meta)
@@ -337,8 +315,8 @@ def iter_record_dirs(records_dir: Path):
 def scan_records(records_dir: Path, limit: int = 300) -> list[dict]:
     """Список записей для окна настроек: по одной записи на папку с meta.json.
 
-    Возвращает словари с полями start/room/dur/status/dir и путями к
-    transcript/summary — всё разобрано из meta.json папки записи.
+    Возвращает словари с полями start/room/dur/status/dir — всё разобрано из
+    meta.json папки записи; dir — фактический путь папки, а не поле журнала.
     """
     out: list[dict] = []
     for call_dir in iter_record_dirs(records_dir):
@@ -359,8 +337,6 @@ def scan_records(records_dir: Path, limit: int = 300) -> list[dict]:
             "ended_at": call.get("ended_at"),
             "duration_sec": call.get("duration_sec") or 0,
             "status": str(call.get("status") or ("done" if meta else "")),
-            "transcript_path": call.get("transcript_path"),
-            "summary_path": call.get("summary_path"),
             "owned": is_owned_meta(meta),
             "_sort": started_at or call_dir.name,
         })

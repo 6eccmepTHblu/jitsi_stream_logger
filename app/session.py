@@ -7,6 +7,10 @@
   finalizing — остановка рекордеров и сборка итоговых файлов.
 
 Второй одновременный созвон не записывается — только журналируется (log_only).
+
+Отдельно есть ручная запись (кнопка в трее): она не привязана к вкладке Chrome
+и нужна как запасной путь, когда расширение молчит. Такая сессия не следит за
+heartbeat и завершается только той же кнопкой или выходом из приложения.
 """
 from __future__ import annotations
 
@@ -30,6 +34,8 @@ from app.recorder.video import VideoRecorder
 log = logging.getLogger(__name__)
 
 CHROME_TITLE_SUFFIXES = (" - Google Chrome", " – Google Chrome")
+
+MANUAL_ROOM = "Ручная запись"
 
 
 def strip_chrome_suffix(title: str) -> str:
@@ -82,7 +88,7 @@ class LogOnlyCall:
 @dataclass
 class ActiveCall:
     call_id: int
-    tab_id: int
+    tab_id: int | None   # None — ручная запись, не привязанная к вкладке
     room: str
     url: str
     title: str
@@ -90,6 +96,7 @@ class ActiveCall:
     call_dir: Path | None
     recorded: bool
     state: str = "active"  # active | grace | finalizing
+    manual: bool = False
     left_ts: float | None = None
     participants: dict[str, dict] = field(default_factory=dict)
     audio_muted: bool | None = None
@@ -299,7 +306,8 @@ class SessionManager:
         now_m = time.monotonic()
         now = time.time()
         c = self.call
-        if c and c.state == "active":
+        # У ручной записи вкладки нет — heartbeat её закрывать не должен.
+        if c and c.state == "active" and not c.manual:
             ts = self.tabs.get(c.tab_id)
             if ts is None or now_m - ts.last_seen > self.cfg.heartbeat_timeout:
                 log.warning("Heartbeat от вкладки %d пропал — закрываю сессию", c.tab_id)
@@ -326,8 +334,22 @@ class SessionManager:
         c.rec_spk.start()
         if self.cfg.video_enabled:
             c.rec_video = VideoRecorder(c.call_dir, self.cfg, c.seglog,
-                                        self._thread_event(c))
+                                        self._thread_event(c),
+                                        mode=self._video_mode_for(c))
             c.rec_video.start(self._needles(c))
+
+    def _video_mode_for(self, c: ActiveCall) -> str | None:
+        """Режим захвата видео; None — как в конфиге.
+
+        У ручной записи нет вкладки созвона, поэтому оконный режим искал бы окно
+        по несуществующему заголовку и вечно держал видео на паузе. Пишем экран:
+        уважаем monitor/cursor из конфига, а «window» подменяем на «cursor».
+        """
+        if not c.manual:
+            return None
+        if self.cfg.video_mode in ("monitor", "cursor"):
+            return None
+        return "cursor"
 
     def _needles(self, c: ActiveCall) -> list[str]:
         out = []
@@ -493,10 +515,9 @@ class SessionManager:
             finalized = False
             try:
                 mute = c.mute_intervals if self.cfg.respect_mic_mute else []
-                result = await mux.finalize_call(self.cfg, c.call_dir,
-                                                 SegmentLog.load(c.call_dir / "segments.json"),
-                                                 mute)
-                c.log.set_files(**result)
+                await mux.finalize_call(self.cfg, c.call_dir,
+                                        SegmentLog.load(c.call_dir / "segments.json"),
+                                        mute)
                 c.log.set_status("done")
                 finalized = True
                 self.notify("Запись сохранена",
@@ -534,6 +555,67 @@ class SessionManager:
             self._refresh_tray()
 
     # ------------------------------------------------------------- сервис
+
+    async def toggle_manual(self) -> None:
+        """Кнопка в трее: начать запись вручную либо остановить текущую.
+
+        Запасной путь на случай, когда расширение не достучалось до приложения
+        (не загрузилось, домен вне matches, Chrome усыпил service worker).
+        """
+        if self._shutting_down:
+            return
+        c = self.call
+        if c is None:
+            await self._start_manual()
+        else:
+            await self._stop_from_tray(c)
+
+    async def _start_manual(self) -> None:
+        now = time.time()
+        try:
+            call_dir = create_call_dir(self.cfg.records_dir, MANUAL_ROOM, now)
+        except OSError:
+            log.exception("Ручной старт: не удалось создать папку записи")
+            self.notify("Не удалось начать запись",
+                        "Ошибка создания папки записи (см. лог)")
+            return
+        self._seq += 1
+        c = ActiveCall(call_id=self._seq, tab_id=None, room=MANUAL_ROOM, url="",
+                       title="", started_ts=now, call_dir=call_dir,
+                       recorded=True, manual=True)
+        self.call = c
+        c.log.add_event(now, "manual_start", None)
+        log.info("Ручной старт записи (#%d): %s", c.call_id, call_dir.name)
+        if not c.log.write():
+            self.notify("Ошибка журнала",
+                        f"«{MANUAL_ROOM}»: не удалось сохранить meta.json")
+        try:
+            await asyncio.to_thread(self._start_media, c)
+        except Exception:
+            log.exception("Ручной старт: не удалось запустить рекордеры")
+            c.log.add_event(time.time(), "record_start_failed", None)
+            c.log.write()
+            self.notify("Ошибка записи",
+                        f"«{MANUAL_ROOM}»: рекордеры не запустились (см. лог)")
+        else:
+            self.notify("Идёт ручная запись",
+                        "Остановить — той же кнопкой в трее")
+        self._refresh_tray()
+
+    async def _stop_from_tray(self, c: ActiveCall) -> None:
+        """Немедленная остановка текущей записи без ожидания grace."""
+        if c.state == "finalizing":
+            return
+        now = time.time()
+        if self._grace_task:
+            self._grace_task.cancel()
+            self._grace_task = None
+        c.left_ts = now
+        c.log.add_event(now, "manual_stop", None)
+        c.log.write()
+        log.info("Остановка записи «%s» (#%d) из трея", c.room, c.call_id)
+        # Финализация сама переводит трей в состояние «сборка записи…».
+        self._schedule_finalize(c, "manual")
 
     def set_paused(self, paused: bool) -> None:
         self.paused = paused

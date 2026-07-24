@@ -183,14 +183,6 @@ async def finalize_call(cfg: Config, call_dir: Path, segdata: dict,
                  "-c:a", "libopus", "-b:a", "48k", "-vbr", "on",
                  "-application", "voip", str(mix_path)]
         await _run_ffmpeg(cfg, args, log_path)
-        wav_path = call_dir / "mix_16k_mono.wav"
-        await _run_ffmpeg(
-            cfg,
-            ["-loglevel", "warning", "-i", str(mix_path),
-             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-             str(wav_path)],
-            log_path)
-        result["asr_wav_path"] = str(wav_path)
 
     # Основной артефакт: mp4 с видео либо m4a без него.
     if video_segs:
