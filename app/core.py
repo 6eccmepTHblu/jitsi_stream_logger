@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from app import records, summarize, transcribe
-from app.config import Config, load_config
+from app.config import Config, load_config, set_config_value
 from app.records import CallLog
 from app.recorder import mux
 from app.recorder.segments import SegmentLog
@@ -60,12 +60,35 @@ class App:
             self.loop.call_soon_threadsafe(self.sm.set_paused, not self.sm.paused)
 
     @property
+    def wait_for_second(self) -> bool:
+        return bool(self.cfg.record_from_second_participant)
+
+    def toggle_wait_for_second(self) -> None:
+        """Тумблер в трее: не писать, пока в конференции никого, кроме нас.
+
+        Значение сохраняется в config.toml, поэтому переживает перезапуск.
+        Правку подхватит и watchdog, но self.cfg обновляем сразу — иначе
+        следующий созвон в ближайшие 5 секунд пошёл бы по старому режиму.
+        """
+        new = not self.cfg.record_from_second_participant
+        try:
+            set_config_value("general", "record_from_second_participant", new)
+        except OSError:
+            log.exception("Не удалось сохранить режим ожидания участников")
+            self.notify("Ошибка", "Не удалось сохранить настройку (см. лог)")
+            return
+        self.cfg.record_from_second_participant = new
+        log.info("Запись только со второго участника: %s", new)
+
+    @property
     def record_action_text(self) -> str:
         """Подпись кнопки записи в трее (читается из потока трея)."""
         sm = self.sm
         call = sm.call if sm is not None else None
         if call is None:
             return "Начать запись вручную"
+        if call.awaiting:
+            return "Начать запись сейчас"
         if call.manual:
             return "Остановить ручную запись"
         return "Остановить запись созвона"
@@ -243,10 +266,11 @@ class App:
         if new.ws_port != self.cfg.ws_port:
             log.warning("ws_port изменён (%d -> %d) — нужен перезапуск приложения",
                         self.cfg.ws_port, new.ws_port)
-        for f in ("records_dir", "allowed_domains", "auto_record", "ffmpeg_path",
+        for f in ("records_dir", "allowed_domains", "auto_record",
+                  "record_from_second_participant", "ffmpeg_path",
                   "video_enabled", "video_mode", "video_monitor", "video_fps",
                   "video_crf", "video_preset", "video_encoder",
-                  "video_quality_preset", "av1_preset", "av1_crf",
+                  "video_quality_preset", "video_scale", "av1_preset", "av1_crf",
                   "respect_mic_mute", "mic_denoise", "echo_duck",
                   "tr_enabled", "tr_url", "tr_poll_s",
                   "tr_timeout_min", "sum_enabled", "sum_url", "sum_model",

@@ -57,6 +57,9 @@ class Tray:
             pystray.MenuItem("Пауза обнаружения",
                              lambda icon, item: self.app.toggle_pause(),
                              checked=lambda item: self.app.paused),
+            pystray.MenuItem("Писать только со второго участника",
+                             lambda icon, item: self.app.toggle_wait_for_second(),
+                             checked=lambda item: self.app.wait_for_second),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", lambda icon, item: self.app.request_quit()),
         )

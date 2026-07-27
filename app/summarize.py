@@ -86,7 +86,6 @@ def run(cfg, transcript: str, room: str = "", started_at: str = "") -> str:
              "role": "user"},
         ],
         "model": cfg.sum_model,
-        "thinking": {"type": "disabled"},
         "temperature": cfg.sum_temperature,
     }
     req = urllib.request.Request(

@@ -19,7 +19,12 @@ from tkinter import filedialog, messagebox, ttk
 
 from app import autostart, records, summarize, transcribe
 from app.config import APP_TITLE, appdata_dir, load_config, set_config_value
-from app.recorder.encode import VIDEO_QUALITY_KEYS, VIDEO_QUALITY_PRESETS
+from app.recorder.encode import (
+    VIDEO_QUALITY_KEYS,
+    VIDEO_QUALITY_PRESETS,
+    VIDEO_SCALE_KEYS,
+    VIDEO_SCALE_PRESETS,
+)
 
 DELETABLE_STATUSES = records.DELETABLE_STATUSES
 
@@ -165,7 +170,7 @@ def _build_settings_tab(frm: ttk.Frame, cfg):
 # --------------------------------------------------------- вкладка «качество»
 
 def _build_quality_tab(frm: ttk.Frame, cfg):
-    """Радио-выбор пресета кодека; применяется к итоговому видео (call.mp4)."""
+    """Радио-выбор кодека и масштаба; применяется к итоговому видео (call.mp4)."""
     # Текущий пресет: из config, иначе выводим из ранее выбранного кодека
     # (совместимость со старыми config.toml, где был только encoder).
     current = getattr(cfg, "video_quality_preset", "") or ""
@@ -175,7 +180,7 @@ def _build_quality_tab(frm: ttk.Frame, cfg):
 
     ttk.Label(
         frm,
-        text="Кодек и параметры сжатия итогового видео созвона (call.mp4).",
+        text="Кодек, параметры сжатия и размер итогового видео (call.mp4).",
     ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
     lf = ttk.LabelFrame(frm, text="Кодек и параметры", padding=8)
@@ -187,15 +192,35 @@ def _build_quality_tab(frm: ttk.Frame, cfg):
         ttk.Label(lf, text=p["hint"], foreground="#777").grid(
             row=i * 2 + 1, column=0, sticky="w", padx=(24, 0))
 
+    current_s = getattr(cfg, "video_scale", "") or "original"
+    if current_s not in VIDEO_SCALE_KEYS:
+        current_s = "original"
+    var_s = tk.StringVar(value=current_s)
+
+    lf_s = ttk.LabelFrame(frm, text="Масштабирование", padding=8)
+    lf_s.grid(row=2, column=0, sticky="we", pady=(8, 0))
+    for i, p in enumerate(VIDEO_SCALE_PRESETS):
+        ttk.Radiobutton(lf_s, text=p["label"], value=p["key"],
+                        variable=var_s).grid(row=i, column=0, sticky="w",
+                                             pady=(4 if i else 0, 0))
+        ttk.Label(lf_s, text=p["hint"], foreground="#777").grid(
+            row=i, column=1, sticky="w", padx=(12, 0),
+            pady=(4 if i else 0, 0))
+
     ttk.Label(
         frm, foreground="#777", justify="left",
         text=("CRF больше — меньше размер и ниже качество. H.265, AV1 и VP9\n"
               "дают меньший файл, чем H.264, но сильнее нагружают процессор\n"
-              "и хуже совместимы со старыми плеерами."),
-    ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+              "и хуже совместимы со старыми плеерами.\n"
+              "Масштаб ограничивает высоту кадра, ширина считается по\n"
+              "пропорции; запись меньше предела не растягивается. Любое\n"
+              "масштабирование заставляет пересжать видео при сборке —\n"
+              "финализация записи занимает дольше."),
+    ).grid(row=3, column=0, sticky="w", pady=(10, 0))
 
     def collect() -> bool:
         set_config_value("video", "quality_preset", var_q.get())
+        set_config_value("video", "scale", var_s.get())
         return True
 
     return collect

@@ -42,6 +42,54 @@ VIDEO_QUALITY_PRESETS: list[dict] = [
 
 VIDEO_QUALITY_KEYS = frozenset(p["key"] for p in VIDEO_QUALITY_PRESETS)
 
+# Пресеты масштабирования итогового видео — вторая группа на той же вкладке
+# настроек. Ключ хранится в config ([video] scale) и ограничивает высоту кадра
+# call.mp4; ширина пересчитывается пропорционально, кадр меньше предела не
+# растягивается. Как и с кодеком, этот список — единственный источник правды
+# о наборе вариантов (по нему рисуются радио-кнопки в GUI).
+VIDEO_SCALE_PRESETS: list[dict] = [
+    {"key": "original", "height": 0,
+     "label": "Оригинал",
+     "hint": "не менять разрешение записи"},
+    {"key": "1440", "height": 1440,
+     "label": "Не выше 1440p (2K)",
+     "hint": "уменьшает только записи выше 2K"},
+    {"key": "1080", "height": 1080,
+     "label": "Не выше 1080p (Full HD)",
+     "hint": "самый ходовой размер"},
+    {"key": "720", "height": 720,
+     "label": "Не выше 720p (HD)",
+     "hint": "заметно меньше файл, текст мельче"},
+    {"key": "480", "height": 480,
+     "label": "Не выше 480p",
+     "hint": "минимальный размер, мелкий текст почти не читается"},
+]
+
+VIDEO_SCALE_KEYS = frozenset(p["key"] for p in VIDEO_SCALE_PRESETS)
+
+_SCALE_HEIGHTS = {p["key"]: int(p["height"]) for p in VIDEO_SCALE_PRESETS}
+
+
+def scale_max_height(cfg: Config) -> int:
+    """Предел высоты итогового видео в пикселях; 0 — не масштабировать.
+
+    Неизвестный (или пустой) ключ трактуем как «Оригинал»: правка config.toml
+    руками не должна незаметно менять разрешение записей.
+    """
+    return _SCALE_HEIGHTS.get(getattr(cfg, "video_scale", "") or "original", 0)
+
+
+def scaled_dims(w: int, h: int, max_h: int) -> tuple[int, int]:
+    """Размер кадра после ограничения высоты: пропорции сохранены, стороны чётные.
+
+    Кадр ниже предела возвращается без изменений — вверх не растягиваем.
+    """
+    if max_h <= 0 or h <= 0 or h <= max_h:
+        return w, h
+    new_h = max_h - max_h % 2
+    new_w = max(2, round(w * new_h / h / 2) * 2)
+    return new_w, new_h
+
 
 def _quality_preset_args(key: str, g: str) -> list[str] | None:
     """Аргументы `-c:v …` для пресета качества, либо None для неизвестного."""

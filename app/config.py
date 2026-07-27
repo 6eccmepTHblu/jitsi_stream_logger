@@ -31,6 +31,11 @@ allowed_domains = ["meet.jit.si"]
 ws_port = 8765
 # Автоматически записывать все созвоны (false = только журнал, без медиа).
 auto_record = true
+# Не начинать запись, пока в конференции никого, кроме вас: зашли раньше всех —
+# пишется только журнал, медиа стартует в момент прихода второго участника, и
+# он же считается началом созвона. Переключается из меню в трее. Если
+# расширение не смогло получить список участников, запись начинается сразу.
+record_from_second_participant = false
 # Путь к ffmpeg (по умолчанию берётся из PATH).
 ffmpeg_path = "ffmpeg"
 
@@ -55,6 +60,11 @@ preset = "veryfast"
 #   vp9_crf40   — VP9 (libvpx-vp9, CRF 40, b:v 0)
 # Пусто ("") — использовать encoder/crf/preset ниже (совместимость).
 quality_preset = "h264_crf28"
+# Масштабирование итогового видео (вкладка «Качество видео»). Ограничивает
+# высоту кадра call.mp4, ширина пересчитывается пропорционально; запись ниже
+# предела не растягивается. Значения: "original" (не менять), "1440", "1080",
+# "720", "480". Любое масштабирование заставляет пересжать видео при сборке.
+scale = "original"
 # libx264 | libsvtav1 (AV1, меньше размер) | h264_nvenc | h264_qsv | h264_amf
 # Аппаратный AV1 (av1_nvenc) требует NVIDIA RTX 40+; на старых картах — libsvtav1.
 # Действует только при пустом quality_preset.
@@ -113,6 +123,7 @@ class Config:
     allowed_domains: tuple[str, ...]
     ws_port: int
     auto_record: bool
+    record_from_second_participant: bool
     ffmpeg_path: str
     video_enabled: bool
     video_mode: str          # "window" | "monitor"
@@ -122,6 +133,7 @@ class Config:
     video_preset: str
     video_encoder: str
     video_quality_preset: str
+    video_scale: str         # "original" | "1440" | "1080" | "720" | "480"
     av1_preset: int
     av1_crf: int
     respect_mic_mute: bool
@@ -178,6 +190,8 @@ def load_config() -> Config:
         allowed_domains=tuple(str(d).lower() for d in gen.get("allowed_domains", ["meet.jit.si"])),
         ws_port=int(gen.get("ws_port", 8765)),
         auto_record=bool(gen.get("auto_record", True)),
+        record_from_second_participant=bool(
+            gen.get("record_from_second_participant", False)),
         ffmpeg_path=str(gen.get("ffmpeg_path", "ffmpeg")),
         video_enabled=bool(video.get("enabled", True)),
         video_mode=str(video.get("mode", "window")),
@@ -187,6 +201,7 @@ def load_config() -> Config:
         video_preset=str(video.get("preset", "veryfast")),
         video_encoder=str(video.get("encoder", "libx264")),
         video_quality_preset=str(video.get("quality_preset", "")),
+        video_scale=str(video.get("scale", "original")),
         av1_preset=int(video.get("av1_preset", 7)),
         av1_crf=int(video.get("av1_crf", 38)),
         respect_mic_mute=bool(audio.get("respect_mic_mute", True)),

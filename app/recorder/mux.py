@@ -16,7 +16,7 @@ import logging
 from pathlib import Path
 
 from app.config import Config
-from app.recorder.encode import video_encode_args
+from app.recorder.encode import scale_max_height, scaled_dims, video_encode_args
 
 log = logging.getLogger(__name__)
 
@@ -257,7 +257,11 @@ async def _mux_video(cfg: Config, call_dir: Path, video_segs: list[dict],
     for t in tracks:
         args += ["-i", str(t)]
 
-    copy_ok = (len(segs) == 1 and leads[0] <= COPY_MODE_MAX_LEAD_S)
+    # Масштабирование обязывает пересжать: поток «как есть» скопировать нельзя.
+    max_h = scale_max_height(cfg)
+    need_scale = max_h > 0 and any(int(v["height"]) > max_h for v in segs)
+    copy_ok = (len(segs) == 1 and leads[0] <= COPY_MODE_MAX_LEAD_S
+               and not need_scale)
     if copy_ok:
         fc = fc_audio
         args += (["-filter_complex", fc] if fc else [])
@@ -265,6 +269,11 @@ async def _mux_video(cfg: Config, call_dir: Path, video_segs: list[dict],
     else:
         w = max(int(v["width"]) // 2 * 2 for v in segs)
         h = max(int(v["height"]) // 2 * 2 for v in segs)
+        # Общий кадр сжимаем целиком: сегменты и так вписываются в него
+        # фильтром scale+pad ниже, отдельно масштабировать каждый не нужно.
+        w, h = scaled_dims(w, h, max_h)
+        if need_scale:
+            log.info("Масштабирование итогового видео до %dx%d", w, h)
         fps = int(segs[0].get("fps") or cfg.video_fps)
         chains = []
         for i, (v, lead) in enumerate(zip(segs, leads)):

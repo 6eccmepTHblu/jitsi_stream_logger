@@ -11,6 +11,10 @@
 Отдельно есть ручная запись (кнопка в трее): она не привязана к вкладке Chrome
 и нужна как запасной путь, когда расширение молчит. Такая сессия не следит за
 heartbeat и завершается только той же кнопкой или выходом из приложения.
+
+При включённом `record_from_second_participant` созвон, в который вы зашли
+первым, сначала только журналируется (ожидание, `awaiting`), а медиа стартует
+в момент прихода второго участника — он же становится началом созвона.
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from urllib.parse import urlparse
 
 from app import summarize, transcribe
 from app.config import Config
-from app.records import CallLog
+from app.records import CallLog, ts_iso
 from app.recorder import mux
 from app.recorder.audio import AudioRecorder
 from app.recorder.segments import SegmentLog
@@ -48,6 +52,27 @@ def strip_chrome_suffix(title: str) -> str:
 def safe_name(s: str, max_len: int = 50) -> str:
     s = re.sub(r"[^\w\-. а-яА-ЯёЁ]", "_", s, flags=re.UNICODE).strip(" ._")
     return s[:max_len] or "room"
+
+
+def others_present(participants) -> bool | None:
+    """Есть ли в конференции кто-то кроме нас.
+
+    None — расширение не смогло получить список (сильно изменённая сборка Jitsi,
+    деградация page-hook до DOM-эвристики). Отличать «никого нет» от «не знаем»
+    обязательно: во втором случае откладывать запись нельзя, иначе созвон
+    молча не запишется.
+    """
+    if not isinstance(participants, list):
+        return None
+    total = 0
+    others = 0
+    for p in participants:
+        if isinstance(p, dict) and p.get("id"):
+            total += 1
+            if not p.get("local"):
+                others += 1
+    # total > 1 — подстраховка на случай, если флаг local не проставлен.
+    return others > 0 or total > 1
 
 
 def create_call_dir(records_dir: Path, room: str, started_ts: float) -> Path:
@@ -97,6 +122,10 @@ class ActiveCall:
     recorded: bool
     state: str = "active"  # active | grace | finalizing
     manual: bool = False
+    # Запись отложена до появления второго участника (медиа ещё не пишется).
+    awaiting: bool = False
+    # Рекордеры хотя бы раз запускались — от этого зависит, нужна ли сборка.
+    media_started: bool = False
     left_ts: float | None = None
     participants: dict[str, dict] = field(default_factory=dict)
     audio_muted: bool | None = None
@@ -110,10 +139,13 @@ class ActiveCall:
 
     def __post_init__(self) -> None:
         if self.log is None:
+            # Пока ждём второго участника, медиа не пишется — журнал обязан
+            # честно говорить log_only. Иначе восстановление после сбоя пошло бы
+            # искать сегменты, которых нет, и пометило бы запись ошибкой.
             self.log = CallLog(
                 room=self.room, url=self.url, tab_id=self.tab_id,
                 started_ts=self.started_ts, call_dir=self.call_dir,
-                recorded=self.recorded)
+                recorded=self.recorded and not self.awaiting)
 
 
 class SessionManager:
@@ -184,6 +216,15 @@ class SessionManager:
         c = self.call
         if c and c.tab_id == tab_id and c.state in ("active", "grace") and snap["joined"]:
             self._update_call_details(c, snap, now)
+            if c.awaiting and c.state == "active":
+                others = others_present(snap.get("participants"))
+                # Список пропал (page-hook свалился в DOM-эвристику) — считать
+                # участников больше нечем, и ждать дальше значило бы потерять
+                # созвон целиком. Начинаем писать.
+                if others is None:
+                    await self._start_awaited(c, now, "participants_unknown")
+                elif others:
+                    await self._start_awaited(c, now, "second_participant")
         lo = self.log_only.get(tab_id)
         if lo and snap["joined"]:
             self._update_log_only(lo, snap, now)
@@ -241,21 +282,30 @@ class SessionManager:
 
         # Новый созвон.
         recorded = self.cfg.auto_record
+        # «Зашёл первым и жду» — пишем пока только журнал (см. модуль-docstring).
+        awaiting = (recorded and self.cfg.record_from_second_participant
+                    and others_present(snap.get("participants")) is False)
         call_dir = create_call_dir(self.cfg.records_dir, room, now)
         self._seq += 1
         call_id = self._seq
         c = ActiveCall(call_id=call_id, tab_id=tab_id, room=room, url=snap["url"],
                        title=snap["title"], started_ts=now, call_dir=call_dir,
-                       recorded=recorded)
+                       recorded=recorded, awaiting=awaiting)
         self.call = c
         c.log.add_event(now, "conference_joined",
                         {"room": room, "url": snap["url"], "via": snap.get("via")})
-        log.info("Созвон начался: «%s» (#%d), запись=%s", room, call_id, recorded)
+        log.info("Созвон начался: «%s» (#%d), запись=%s%s", room, call_id,
+                 recorded, ", ожидание второго участника" if awaiting else "")
+        if awaiting:
+            c.log.add_event(now, "awaiting_participants", None)
         # Пишем сразу для любого режима, включая журнал без медиа.
         if not c.log.write():
             self.notify("Ошибка журнала",
                         f"«{room}»: не удалось сохранить meta.json")
-        if recorded:
+        if awaiting:
+            self.notify("Жду участников",
+                        f"«{room}»: запись начнётся, когда придёт кто-то ещё")
+        elif recorded:
             try:
                 await asyncio.to_thread(self._start_media, c)
             except Exception:
@@ -265,6 +315,36 @@ class SessionManager:
             self.notify("Запись началась", f"Созвон «{room}»")
         else:
             self.notify("Созвон начался", f"«{room}» (журнал без записи)")
+        self._refresh_tray()
+
+    async def _start_awaited(self, c: ActiveCall, now: float,
+                             reason: str) -> None:
+        """Запускает отложенную запись: пришёл второй участник (или мы сдались).
+
+        Началом созвона становится этот момент, а не заход в пустую комнату:
+        иначе список записей показывал бы получасовое ожидание как длительность.
+        Исходное время захода остаётся в журнале событием conference_joined.
+        """
+        waited = max(0.0, now - c.started_ts)
+        c.awaiting = False
+        c.started_ts = now
+        c.log.started_ts = now
+        c.log.started_at = ts_iso(now)
+        c.log.recorded = True
+        c.log.set_status("recording")
+        c.log.add_event(now, "record_started",
+                        {"reason": reason, "waited_sec": round(waited, 1),
+                         "participants": len(c.participants)})
+        log.info("Начинаю отложенную запись «%s» (#%d): %s, ожидание %d с",
+                 c.room, c.call_id, reason, int(waited))
+        c.log.write()
+        try:
+            await asyncio.to_thread(self._start_media, c)
+        except Exception:
+            log.exception("Не удалось запустить отложенную запись")
+            c.log.add_event(time.time(), "record_start_failed", None)
+            c.log.write()
+        self.notify("Запись началась", f"Созвон «{c.room}»")
         self._refresh_tray()
 
     async def _on_unjoined(self, tab_id: int, now: float, reason: str) -> None:
@@ -327,6 +407,9 @@ class SessionManager:
     def _start_media(self, c: ActiveCall) -> None:
         """Запускает рекордеры (вызывается в отдельном потоке)."""
         assert c.call_dir is not None
+        # Ставим до фактического старта: даже частично поднятые рекордеры могли
+        # оставить сегменты, и финализация обязана их собрать.
+        c.media_started = True
         c.seglog = SegmentLog(c.call_dir / "segments.json")
         c.rec_mic = AudioRecorder(c.call_dir, "mic", c.seglog, self._thread_event(c))
         c.rec_spk = AudioRecorder(c.call_dir, "speakers", c.seglog, self._thread_event(c))
@@ -509,7 +592,9 @@ class SessionManager:
                  c.room, reason, dur // 60, dur % 60)
         self.set_tray("finalizing", f"«{c.room}»: сборка записи…")
 
-        if c.recorded and c.call_dir is not None:
+        # media_started, а не recorded: созвон, где мы так и не дождались
+        # второго участника, собирать нечего — там нет ни одного сегмента.
+        if c.recorded and c.media_started and c.call_dir is not None:
             c.log.set_status("finalizing")
             await asyncio.to_thread(self._stop_media, c)
             finalized = False
@@ -526,6 +611,11 @@ class SessionManager:
                 log.exception("Ошибка финализации записи «%s»", c.room)
                 c.log.set_status("error", error=str(e))
                 self.notify("Ошибка сборки записи", f"«{c.room}»: {e}")
+        elif c.awaiting:
+            c.log.set_status("done")
+            self.notify("Записывать было нечего",
+                        f"«{c.room}»: второй участник так и не пришёл "
+                        f"({dur // 60} мин ожидания)")
         else:
             c.log.set_status("done")
             self.notify("Созвон завершён", f"«{c.room}» · {dur // 60} мин {dur % 60} с")
@@ -534,8 +624,8 @@ class SessionManager:
         self._refresh_tray()
         # Долгую сетевую постобработку не держим внутри задачи медиасборки:
         # при выходе ждём только безопасного закрытия и сборки локальных файлов.
-        if (c.recorded and c.call_dir is not None and finalized
-                and self.cfg.tr_enabled and reason != "app_exit"):
+        if (c.recorded and c.media_started and c.call_dir is not None
+                and finalized and self.cfg.tr_enabled and reason != "app_exit"):
             self._schedule_postprocess(c)
 
     async def _postprocess(self, c: ActiveCall) -> None:
@@ -567,6 +657,9 @@ class SessionManager:
         c = self.call
         if c is None:
             await self._start_manual()
+        elif c.awaiting and c.state == "active":
+            # Ждём второго участника, но пользователь решил писать прямо сейчас.
+            await self._start_awaited(c, time.time(), "manual")
         else:
             await self._stop_from_tray(c)
 
@@ -662,6 +755,8 @@ class SessionManager:
             self.set_tray("grace", f"«{c.room}»: ожидание возврата…")
         elif c.state == "finalizing":
             self.set_tray("finalizing", f"«{c.room}»: сборка записи…")
+        elif c.awaiting:
+            self.set_tray("logging", f"«{c.room}»: жду второго участника")
         elif c.recorded:
             self.set_tray("recording", f"«{c.room}»: идёт запись")
         else:
