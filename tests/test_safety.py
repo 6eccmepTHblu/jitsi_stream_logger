@@ -423,5 +423,25 @@ class ExtensionOriginTests(unittest.TestCase):
             "extension/manifest.json не должен быть под контролем версий")
 
 
+class AttendanceTests(unittest.TestCase):
+    def test_overlapping_reconnects_are_counted_once(self) -> None:
+        """У одного человека бывает несколько jitsi_id одновременно.
+        Сумма duration_sec завышает время — итог считаем по объединению."""
+        t0 = time.time()
+        clog = CallLog(room="r", started_ts=t0)
+        clog.participant_joined("a", "Аня", False, t0)
+        clog.participant_joined("a2", "Аня", False, t0 + 60)  # второе устройство
+        clog.participant_left("a", t0 + 120)
+        clog.participant_left("a2", t0 + 180)
+        clog.participant_joined("b", "Боря", False, t0 + 10)  # ещё не вышел
+
+        meta = clog.to_meta()
+        durations = {p["jitsi_id"]: p["duration_sec"] for p in meta["participants"]}
+        self.assertEqual(durations, {"a": 120.0, "a2": 120.0, "b": None})
+        self.assertEqual(
+            meta["attendance"],
+            [{"name": "Аня", "sessions": 2, "total_sec": 180.0}])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,46 @@ def iso_to_ts(iso: str | None) -> float:
         return 0.0
 
 
+def _union_sec(intervals: list[tuple[float, float]]) -> float:
+    """Длина объединения интервалов: пересечения считаются один раз."""
+    total = 0.0
+    end = float("-inf")
+    for a, b in sorted(intervals):
+        if b > end:
+            total += b - max(a, end)
+            end = b
+    return total
+
+
+def with_durations(participants: list[dict]) -> list[dict]:
+    """Добавляет каждому подключению duration_sec (null, пока не вышел)."""
+    out = []
+    for p in participants:
+        joined, left = iso_to_ts(p.get("joined_at")), iso_to_ts(p.get("left_at"))
+        dur = round(max(0.0, left - joined), 1) if joined and left else None
+        out.append({**p, "duration_sec": dur})
+    return out
+
+
+def attendance(participants: list[dict]) -> list[dict]:
+    """Сколько каждый человек пробыл на созвоне, по имени.
+
+    Один человек часто держит несколько jitsi_id одновременно (второе
+    устройство, переподключение), и интервалы пересекаются — сумма
+    duration_sec завышала бы время в разы, поэтому берём объединение.
+    """
+    by_name: dict[str, list[tuple[float, float]]] = {}
+    for p in participants:
+        joined, left = iso_to_ts(p.get("joined_at")), iso_to_ts(p.get("left_at"))
+        if joined and left > joined:
+            by_name.setdefault(str(p.get("name") or ""), []).append((joined, left))
+    out = [{"name": name, "sessions": len(iv),
+            "total_sec": round(_union_sec(iv), 1)}
+           for name, iv in by_name.items()]
+    out.sort(key=lambda r: -r["total_sec"])
+    return out
+
+
 def _write_json_atomic(path: Path, data: dict | list) -> None:
     """Атомарно заменяет JSON-файл, не оставляя обрезанную основную копию."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,13 +260,15 @@ class CallLog:
         }
 
     def to_meta(self) -> dict:
+        participants = with_durations(self.participants)
         return {
             "format": {
                 "app_id": META_APP_ID,
                 "schema_version": META_SCHEMA_VERSION,
             },
             "call": self.call_dict(),
-            "participants": list(self.participants),
+            "participants": participants,
+            "attendance": attendance(participants),
             "events": list(self.events),
         }
 
