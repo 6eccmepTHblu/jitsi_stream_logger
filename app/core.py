@@ -24,6 +24,15 @@ from app.ws_server import WsServer
 log = logging.getLogger(__name__)
 
 
+# Пустой огрызок записи: краш на старте, ни одного сегмента, столько секунд
+# от захода в комнату. Дольше — уже не «не успела начаться», а сломанная запись,
+# и такую надо оставить в журнале с ошибкой.
+EMPTY_STUB_MAX_S = 60.0
+# Файлы, которые появляются до первого сегмента. Всё остальное в папке —
+# признак, что там есть что терять, и удалять её нельзя.
+EMPTY_STUB_FILES = frozenset({"meta.json", "segments.json", "ffmpeg_video.log"})
+
+
 def _iso_to_ts(iso: str | None) -> float:
     if not iso:
         return time.time()
@@ -405,6 +414,8 @@ class App:
         files = [call_dir / s["path"] for s in seg["audio"] + seg["video"]
                  if (call_dir / s["path"]).exists()]
         if not files:
+            if self._drop_empty_stub(call):
+                return
             if not call.ended_at:
                 call.finish(started_ts, started_ts, "crash")
             call.set_status("error", error="recovery: нет сегментов")
@@ -442,6 +453,42 @@ class App:
                               exc_info=(type(exc), exc, exc.__traceback__))
 
             task.add_done_callback(done)
+
+    @staticmethod
+    def _drop_empty_stub(call: CallLog) -> bool:
+        """Удаляет папку записи, которая не успела ничего записать.
+
+        Нативный сбой на старте рекордеров убивает рабочий процесс, супервизор
+        поднимает новый, и тот заводит на тот же созвон вторую папку. Первая
+        остаётся пустой: ни сегментов, ни участников, ни секунды длительности.
+        Держать её в журнале как ошибку — только путать список записей.
+        """
+        call_dir = call.call_dir
+        if call_dir is None or call.participants:
+            return False
+        try:
+            names = {p.name for p in call_dir.iterdir()}
+            end_ts = (call_dir / records.META_NAME).stat().st_mtime
+        except OSError:
+            return False
+        if not names <= EMPTY_STUB_FILES:
+            return False
+        if end_ts - _iso_to_ts(call.started_at) >= EMPTY_STUB_MAX_S:
+            return False
+        # Тот же межпроцессный lock, что у ретеншна и GUI: не удаляем папку
+        # из-под чужого чтения.
+        if not records.try_acquire(call_dir):
+            return False
+        try:
+            log.info("Удаляю пустую папку «%s»: запись не успела начаться",
+                     call_dir.name)
+            shutil.rmtree(call_dir)
+        except OSError:
+            log.exception("Не удалось удалить пустую папку %s", call_dir)
+            return False
+        finally:
+            records.release(call_dir)
+        return True
 
     async def _postprocess_recovered(self, call: CallLog) -> None:
         text = await transcribe.transcribe_call(self.cfg, call, self.notify)

@@ -8,6 +8,7 @@ WGC отдаёт кадры только при изменении содерж�
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import subprocess
 import threading
@@ -28,6 +29,35 @@ log = logging.getLogger(__name__)
 
 CREATE_NO_WINDOW = 0x08000000
 FIND_RETRY_S = 5.0
+
+_mta_keeper_started = threading.Event()
+
+
+def _keep_mta_alive() -> None:
+    """Держит MTA-апартамент процесса живым всё время работы приложения.
+
+    WGC — это WinRT, он живёт в multithreaded-апартаменте. Апартамент
+    существует, пока в нём есть хоть один поток: когда сеанс захвата
+    заканчивается и его поток уходит, апартамент рушится вместе с кэшем
+    WinRT/D3D внутри windows_capture, и следующий `start_free_threaded`
+    разыменовывает протухшие указатели — access violation 0xC0000005 в
+    windows_capture.pyd убивает весь процесс мимо Python.
+
+    Проверено 27.07.2026 на стенде (tools/fake_extension.py, два созвона
+    подряд в одном процессе): без держателя второй захват падал всегда,
+    с ним подряд прошли четыре. Вечный поток в MTA стоит одного потока.
+    """
+    if _mta_keeper_started.is_set():
+        return
+    _mta_keeper_started.set()
+
+    def run() -> None:
+        # RO_INIT_MULTITHREADED = 1; апартамент жив, пока поток не вышел.
+        hr = ctypes.windll.combase.RoInitialize(1)
+        log.info("MTA-держатель: RoInitialize -> 0x%08x", hr & 0xFFFFFFFF)
+        threading.Event().wait()  # никогда
+
+    threading.Thread(target=run, daemon=True, name="mta-keeper").start()
 
 
 def monitor_at_cursor() -> int:
@@ -95,6 +125,7 @@ class VideoRecorder:
         self._fflog = None
 
     def start(self, needles: list[str]) -> None:
+        _keep_mta_alive()
         self.update_needles(needles)
         self._fflog = open(self.out_dir / "ffmpeg_video.log", "ab")
         self._thread = threading.Thread(target=self._run, daemon=True, name="video")

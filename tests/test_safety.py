@@ -167,6 +167,57 @@ class JournalOnlyTests(unittest.IsolatedAsyncioTestCase):
                     for path in call_dir.iterdir()))
 
 
+class EmptyStubRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """Краш на старте записи оставляет пустую папку — её быть не должно."""
+
+    @staticmethod
+    def _stub(records_dir: Path, name: str) -> CallLog:
+        call_dir = records_dir / name
+        call_dir.mkdir(parents=True)
+        call = CallLog(room=name, started_ts=time.time(), call_dir=call_dir,
+                       recorded=True, status="recording")
+        call.add_event(time.time(), "conference_joined", None)
+        if not call.write():
+            raise OSError(f"Не удалось создать тестовый журнал в {call_dir}")
+        (call_dir / "segments.json").write_text('{"audio": [], "video": []}',
+                                                encoding="utf-8")
+        return call
+
+    async def test_stub_without_segments_is_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = App(SimpleNamespace(records_dir=Path(tmp)))
+            call = self._stub(Path(tmp), "crashed")
+
+            await app._recover_one(call)
+
+            self.assertFalse(call.call_dir.exists())
+            self.assertEqual(records.scan_records(Path(tmp)), [])
+
+    async def test_call_with_participants_is_kept_as_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = App(SimpleNamespace(records_dir=Path(tmp)))
+            call = self._stub(Path(tmp), "no-media")
+            call.participant_joined("u1", "Участник", False, time.time())
+            self.assertTrue(call.write())
+
+            await app._recover_one(call)
+
+            self.assertTrue(call.call_dir.exists())
+            self.assertEqual(records.read_meta(call.call_dir)["call"]["status"],
+                             "error")
+
+    async def test_folder_with_other_files_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = App(SimpleNamespace(records_dir=Path(tmp)))
+            call = self._stub(Path(tmp), "has-files")
+            (call.call_dir / "transcript.txt").write_text("текст",
+                                                          encoding="utf-8")
+
+            await app._recover_one(call)
+
+            self.assertTrue((call.call_dir / "transcript.txt").exists())
+
+
 class RecoverySafetyTests(unittest.TestCase):
     def test_recovery_snapshot_is_taken_before_websocket_start(self) -> None:
         source = inspect.getsource(App._amain)
