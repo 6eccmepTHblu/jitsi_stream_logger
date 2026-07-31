@@ -167,6 +167,37 @@ class JournalOnlyTests(unittest.IsolatedAsyncioTestCase):
                     for path in call_dir.iterdir()))
 
 
+class GraceHandoffTests(unittest.IsolatedAsyncioTestCase):
+    """Созвон, начатый сразу после прошлого, обязан писаться, а не журналиться."""
+
+    async def test_new_room_during_grace_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = SimpleNamespace(auto_record=True, records_dir=Path(tmp),
+                                  record_from_second_participant=False,
+                                  grace_seconds=20.0)
+            sm = SessionManager(cfg)
+            sm._start_media = lambda c: None  # без аудио/видео устройств
+            now = time.time()
+
+            await sm._on_joined(1, {"room": "a", "url": "https://x/a",
+                                    "title": "", "via": "test"}, now)
+            first = sm.call
+            await sm._enter_grace(first, "tab_closed", now + 1)
+
+            await sm._on_joined(2, {"room": "b", "url": "https://x/b",
+                                    "title": "", "via": "test"}, now + 8)
+
+            self.assertEqual(sm.log_only, {})
+            self.assertIsNotNone(sm.call)
+            self.assertEqual(sm.call.room, "b")
+            self.assertTrue(sm.call.recorded)
+            await asyncio.gather(*list(sm._finalize_tasks))
+            self.assertEqual(first.log.end_reason, "tab_closed")
+            done = {row["room"]: row["status"]
+                    for row in records.scan_records(Path(tmp))}
+            self.assertEqual(done["a"], "done")
+
+
 class EmptyStubRecoveryTests(unittest.IsolatedAsyncioTestCase):
     """Краш на старте записи оставляет пустую папку — её быть не должно."""
 

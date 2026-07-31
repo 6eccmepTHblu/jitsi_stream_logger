@@ -127,6 +127,7 @@ class ActiveCall:
     # Рекордеры хотя бы раз запускались — от этого зависит, нужна ли сборка.
     media_started: bool = False
     left_ts: float | None = None
+    left_reason: str | None = None
     participants: dict[str, dict] = field(default_factory=dict)
     audio_muted: bool | None = None
     mute_open_ts: float | None = None
@@ -243,6 +244,17 @@ class SessionManager:
     async def _on_joined(self, tab_id: int, snap: dict, now: float) -> None:
         room = snap["room"] or "room"
         c = self.call
+        # Заход в другую комнату во время grace — доказательство, что в прежнюю
+        # мы не вернёмся. Дожидаться таймера нельзя: новый созвон уехал бы в
+        # log_only и остался бы там до закрытия вкладки, без единого сегмента.
+        if c is not None and c.state == "grace" and c.room != room:
+            if self._grace_task:
+                self._grace_task.cancel()
+                self._grace_task = None
+            log.info("Созвон «%s» начался во время grace «%s» — закрываю прежний",
+                     room, c.room)
+            self._schedule_finalize(c, c.left_reason or "left")
+            c = self.call  # финализация уже сняла ссылку
         if c is not None:
             if c.state == "grace" and c.room == room:
                 # Возврат после F5/переоткрытия — продолжаем ту же сессию.
@@ -358,6 +370,7 @@ class SessionManager:
     async def _enter_grace(self, c: ActiveCall, reason: str, now: float) -> None:
         c.state = "grace"
         c.left_ts = now
+        c.left_reason = reason
         c.log.add_event(now, "conference_left", {"reason": reason})
         c.log.write()
         log.info("Выход из созвона «%s» (%s) — grace %.0f с", c.room, reason,
